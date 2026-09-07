@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # Find the runtime from the currently installed package after every upgrade.
 set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin

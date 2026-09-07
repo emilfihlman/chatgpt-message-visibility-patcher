@@ -1,3 +1,6 @@
+Original added-line contribution: MIT OR CC0-1.0 (see LICENSE and LICENSE-CC0).
+Existing app code in context and removed lines retains its original rights.
+
 --- renderer-classifier.before.js
 +++ renderer-classifier.after.js
 @@ -12,6 +12,5 @@

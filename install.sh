@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -20,6 +21,7 @@ esac
 source_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 install -d -o root -g root -m 0755 /usr/local/lib/chatgpt-message-visibility/vendor/acorn /usr/local/bin /etc/apt/apt.conf.d
 install -o root -g root -m 0644 "$source_directory/patch-message-visibility.mjs" /usr/local/lib/chatgpt-message-visibility/patch-message-visibility.mjs
+install -o root -g root -m 0644 "$source_directory/LICENSE" "$source_directory/LICENSE-CC0" /usr/local/lib/chatgpt-message-visibility/
 install -o root -g root -m 0644 "$source_directory/vendor/acorn/acorn.mjs" "$source_directory/vendor/acorn/LICENSE" /usr/local/lib/chatgpt-message-visibility/vendor/acorn/
 install -o root -g root -m 0755 "$source_directory/chatgpt-message-visibility" /usr/local/bin/chatgpt-message-visibility
 # Confirm this package is supported and apply before registering automatic runs.

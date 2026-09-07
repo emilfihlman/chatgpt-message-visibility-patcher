@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: MIT
 // A narrow structural match tolerates names/hashes, not changed logic.
 // Vendored Acorn verifies candidates are executable syntax, never examples in strings/comments.
 import fs from 'node:fs';
@@ -68,6 +69,8 @@ export function patchBundle(source) {
   if (matches.length !== 1) throw new Error(`Unsupported or ambiguous classifier (${matches.length} matches); no changes.`);
   const match = matches[0];
   if (match.status === 'patched') throw new Error('Classifier already keeps authored messages persistent.');
+  // The original visibility expression below is also offered under CC0-1.0;
+  // recipients may choose MIT OR CC0-1.0 for that contribution (see LICENSE-CC0).
   const expression = `${match.item}.type===\x60assistant-message\x60||${match.item}.type===\x60user-message\x60`;
   const length = Buffer.byteLength(match.predicate);
   if (Buffer.byteLength(expression) > length) throw new Error('Replacement does not fit the original predicate.');
