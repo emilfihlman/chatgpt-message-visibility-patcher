@@ -1,0 +1,55 @@
+#!/bin/sh
+# Find the runtime from the currently installed package after every upgrade.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+mode=${1:---check}
+hook=false
+if [ "$mode" = '--apt-hook' ]; then
+  hook=true
+  mode=--apply
+  shift
+fi
+if [ "$hook" = true ] && [ "$(dpkg-query -W '-f=${db:Status-Status}' chatgpt 2>/dev/null || :)" != installed ]; then
+  exit 0
+fi
+run_patch() {
+  runtime=$(dpkg-query -L chatgpt 2>/dev/null | awk '/\/resources\/cua_node\/bin\/node$/ { print }')
+  case "$runtime" in
+    *'
+'*) printf '%s\n' 'Ambiguous ChatGPT Node.js runtime.' >&2; return 1 ;;
+  esac
+  if [ -z "$runtime" ] || [ ! -x "$runtime" ]; then
+    runtime=/usr/bin/node
+    if [ ! -x "$runtime" ]; then
+      printf '%s\n' 'No Node.js runtime found. Install Node.js or a ChatGPT package that bundles it.' >&2
+      return 1
+    fi
+  fi
+  script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  helper="$script_directory/patch-message-visibility.mjs"
+  if [ ! -f "$helper" ]; then helper=/usr/local/lib/chatgpt-message-visibility/patch-message-visibility.mjs; fi
+  if [ "$mode" = --check ]; then
+    "$runtime" "$helper" "$@"
+  else
+    # Root-owned installed copies are used by APT; prevent simultaneous writers.
+    if [ "$(id -u)" = 0 ]; then
+      flock -x /run/lock/chatgpt-message-visibility.lock "$runtime" "$helper" "$@"
+    else
+      "$runtime" "$helper" "$@"
+    fi
+  fi
+}
+if [ "$hook" = true ]; then
+  if output=$(run_patch "$mode" "$@" 2>&1); then
+    case "$output" in
+      *'Already persistent; no changes.'*) ;;
+      *) printf '%s\n' "$output" ;;
+    esac
+  else
+    printf '%s\n' "ChatGPT message visibility patch skipped: $output" >&2
+    printf '%s\n' 'APT can continue. Run chatgpt-message-visibility --check to inspect this build.' >&2
+  fi
+  exit 0
+fi
+run_patch "$@"

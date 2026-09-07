@@ -1,0 +1,10 @@
+--- renderer-classifier.before.js
++++ renderer-classifier.after.js
+@@ -12,6 +12,5 @@
+       i.type === `mcp-tool-call` &&
+       qE({ item: i, mcpServerStatuses: n }))
+     ? !0
+-    : i.type === `user-message` &&
+-        (i.steeringStatus != null || i.hookFeedback === !0);
++    : i.type === `assistant-message` || i.type === `user-message`;
+ }

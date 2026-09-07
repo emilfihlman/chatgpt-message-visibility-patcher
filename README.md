@@ -1,0 +1,50 @@
+# ChatGPT Desktop message visibility patch
+
+Keeps assistant and user messages visible when a completed turn's activity is
+collapsed in the Linux desktop app. The renderer currently classifies assistant
+messages and some user messages as collapsible activity. The patch keeps these
+authored messages in the persistent group; duplicate text may remain visible.
+
+[renderer-classifier.patch](renderer-classifier.patch) shows the one-expression
+change. The installer applies it to the packaged renderer automatically.
+
+## Install
+
+For the Debian/APT package named `chatgpt`. Download and extract this repository,
+or clone it, then run from its directory:
+
+```sh
+sudo sh ./install.sh
+chatgpt-message-visibility --check
+```
+
+Restart ChatGPT to load the change. The installer finds the installed package and
+its bundled Node.js runtime, with `/usr/bin/node` as a fallback. No npm install is
+needed. It backs up the original archive and installs an APT hook that reapplies
+the patch after compatible package updates, including renamed renderer assets.
+
+Verified against build **26.901.51231**. Unrecognized or ambiguous renderer logic
+is left untouched and produces a warning; future builds may need an updated
+patcher. Direct `dpkg -i` installations require running the helper manually:
+
+```sh
+sudo /usr/local/bin/chatgpt-message-visibility --apply
+```
+
+## Undo
+
+Disable automatic reapplication, restore the matching original backup, then
+restart ChatGPT:
+
+```sh
+sudo sh ./install.sh --remove-hook
+sudo /usr/local/bin/chatgpt-message-visibility --restore
+```
+
+This leaves the helper and backups available. Backups sit beside `app.asar` and
+are retained across upgrades.
+
+The patch only affects messages already delivered to the desktop renderer. It
+does not recover deleted messages or fix the mobile app. The bundled Acorn
+parser checks JavaScript structure before patching and requires its included
+[MIT license](vendor/acorn/LICENSE).
