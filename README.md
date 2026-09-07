@@ -23,9 +23,11 @@ its bundled Node.js runtime, with `/usr/bin/node` as a fallback. No npm install 
 needed. It backs up the original archive and installs an APT hook that reapplies
 the patch after compatible package updates, including renamed renderer assets.
 
-Verified against build **26.901.51231**. Unrecognized or ambiguous renderer logic
-is left untouched and produces a warning; future builds may need an updated
-patcher. Direct `dpkg -i` installations require running the helper manually:
+Isolated renderer and archive checks passed against build **26.901.51231**;
+full desktop end-to-end behavior has not been verified. Unrecognized or ambiguous
+renderer logic is left untouched and produces a warning; future builds may need
+an updated patcher. Direct `dpkg -i` installations require running the helper
+manually:
 
 ```sh
 sudo /usr/local/bin/chatgpt-message-visibility --apply
@@ -48,6 +50,8 @@ The patch only affects messages already delivered to the desktop renderer. It
 does not recover deleted messages or fix the mobile app. The bundled Acorn
 parser checks JavaScript structure before patching and requires its included
 [MIT license](vendor/acorn/LICENSE).
+
+All original work on this project was done with **GPT-6 Astra Ultra**.
 
 ## License
 
