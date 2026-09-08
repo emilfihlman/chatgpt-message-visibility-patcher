@@ -4,17 +4,50 @@
 set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
-mode=${1:---check}
+operation=${1:---check}
 hook=false
-if [ "$mode" = '--apt-hook' ]; then
+if [ "$operation" = '--apt-hook' ]; then
   hook=true
-  mode=--apply
   shift
+  set -- --apply "$@"
+  operation=--apply
 fi
 if [ "$hook" = true ] && [ "$(dpkg-query -W '-f=${db:Status-Status}' chatgpt 2>/dev/null || :)" != installed ]; then
   exit 0
 fi
 run_patch() {
+  script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || return 1
+  helper="$script_directory/patch-message-visibility.mjs"
+  installed=false
+  if [ ! -f "$helper" ]; then
+    helper=/usr/local/lib/chatgpt-message-visibility/patch-message-visibility.mjs
+    if [ "$(readlink -f -- "$0")" = /usr/local/bin/chatgpt-message-visibility ]; then installed=true; fi
+  fi
+  # Keep archive changes and the saved selection under the same writer lock.
+  if [ "$operation" != --check ] && [ "$(id -u)" = 0 ]; then
+    exec 9>/run/lock/chatgpt-message-visibility.lock
+    flock -x 9 || return 1
+  fi
+  save_mode=false
+  if [ "$operation" = --apply ]; then
+    shift
+    selection=/usr/local/lib/chatgpt-message-visibility/mode
+    if [ "${1:-}" = --mode ]; then
+      selected_mode=${2:-}
+      # Leave argument validation to the helper before saving anything.
+      if [ "$#" = 2 ]; then save_mode=true; fi
+    else
+      selected_mode=messages
+      if [ -f "$selection" ]; then selected_mode=$(cat -- "$selection"); fi
+      case "$selected_mode" in
+        messages|all) ;;
+        *) printf '%s\n' 'Invalid saved mode. Run --apply --mode messages or --apply --mode all to select it again.' >&2; return 1 ;;
+      esac
+      if [ "$#" = 0 ]; then save_mode=true; fi
+      set -- --mode "$selected_mode" "$@"
+    fi
+    set -- --apply "$@"
+  fi
   runtime=$(dpkg-query -L chatgpt 2>/dev/null | awk '/\/resources\/cua_node\/bin\/node$/ { print }')
   case "$runtime" in
     *'
@@ -27,24 +60,21 @@ run_patch() {
       return 1
     fi
   fi
-  script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-  helper="$script_directory/patch-message-visibility.mjs"
-  if [ ! -f "$helper" ]; then helper=/usr/local/lib/chatgpt-message-visibility/patch-message-visibility.mjs; fi
-  if [ "$mode" = --check ]; then
-    "$runtime" "$helper" "$@"
-  else
-    # Root-owned installed copies are used by APT; prevent simultaneous writers.
-    if [ "$(id -u)" = 0 ]; then
-      flock -x /run/lock/chatgpt-message-visibility.lock "$runtime" "$helper" "$@"
-    else
-      "$runtime" "$helper" "$@"
-    fi
+  "$runtime" "$helper" "$@" || return "$?"
+  if [ "$save_mode" = true ] && [ "$installed" = true ] && [ "$(id -u)" = 0 ]; then
+    case "$selected_mode" in messages|all) ;; *) return 1 ;; esac
+    selection_temp=$(mktemp "${selection}.XXXXXX") || return 1
+    trap 'rm -f -- "$selection_temp"' EXIT HUP INT TERM
+    printf '%s\n' "$selected_mode" > "$selection_temp" &&
+      chown root:root "$selection_temp" && chmod 0644 "$selection_temp" &&
+      mv -f -- "$selection_temp" "$selection" || return 1
+    trap - EXIT HUP INT TERM
   fi
 }
 if [ "$hook" = true ]; then
-  if output=$(run_patch "$mode" "$@" 2>&1); then
+  if output=$(run_patch "$@" 2>&1); then
     case "$output" in
-      *'Already persistent; no changes.'*) ;;
+      *'Already persistent; no changes.'*|*'Already patched in messages mode; no changes.'*|*'Already patched in all mode; no changes.'*) ;;
       *) printf '%s\n' "$output" ;;
     esac
   else

@@ -4,7 +4,7 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 if [ "$(id -u)" != 0 ]; then
-  printf '%s\n' 'Run sudo ./install.sh to install, or sudo ./install.sh --remove-hook to disable automatic reapplication.' >&2
+  printf '%s\n' 'Run sudo sh ./install.sh [--mode messages|all] to install, or sudo sh ./install.sh --remove-hook to disable automatic reapplication.' >&2
   exit 1
 fi
 hook=/etc/apt/apt.conf.d/99-chatgpt-message-visibility
@@ -16,7 +16,17 @@ case "${1:-}" in
     exit 0
     ;;
   '') ;;
-  *) printf '%s\n' 'Usage: sudo ./install.sh [--remove-hook]' >&2; exit 1 ;;
+  --mode)
+    if [ "$#" != 2 ]; then
+      printf '%s\n' 'Usage: sudo sh ./install.sh [--mode messages|all | --remove-hook]' >&2
+      exit 1
+    fi
+    case "$2" in
+      messages|all) ;;
+      *) printf '%s\n' 'Mode must be messages or all.' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf '%s\n' 'Usage: sudo sh ./install.sh [--mode messages|all | --remove-hook]' >&2; exit 1 ;;
 esac
 source_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 install -d -o root -g root -m 0755 /usr/local/lib/chatgpt-message-visibility/vendor/acorn /usr/local/bin /etc/apt/apt.conf.d
@@ -24,8 +34,9 @@ install -o root -g root -m 0644 "$source_directory/patch-message-visibility.mjs"
 install -o root -g root -m 0644 "$source_directory/LICENSE" "$source_directory/LICENSE-CC0" /usr/local/lib/chatgpt-message-visibility/
 install -o root -g root -m 0644 "$source_directory/vendor/acorn/acorn.mjs" "$source_directory/vendor/acorn/LICENSE" /usr/local/lib/chatgpt-message-visibility/vendor/acorn/
 install -o root -g root -m 0755 "$source_directory/chatgpt-message-visibility" /usr/local/bin/chatgpt-message-visibility
-# Confirm this package is supported and apply before registering automatic runs.
-/usr/local/bin/chatgpt-message-visibility --apply
+# Apply before registering automatic runs. The launcher saves the mode only on
+# success; without --mode it keeps the previous choice (initially messages).
+/usr/local/bin/chatgpt-message-visibility --apply "$@"
 hook_temp=$(mktemp /etc/apt/apt.conf.d/.chatgpt-message-visibility.XXXXXX)
 trap 'rm -f -- "$hook_temp"' EXIT HUP INT TERM
 printf '%s\n' 'DPkg::Post-Invoke { "/usr/local/bin/chatgpt-message-visibility --apt-hook || true"; };' > "$hook_temp"
