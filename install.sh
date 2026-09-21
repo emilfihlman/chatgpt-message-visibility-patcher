@@ -12,6 +12,7 @@ case "${1:-}" in
   --remove-hook)
     if [ "$#" != 1 ]; then exit 1; fi
     rm -f -- "$hook"
+    rm -f -- /usr/local/lib/chatgpt-message-visibility/last-hook-failure
     printf '%s\n' 'APT hook removed. The existing patch and backups are retained.'
     exit 0
     ;;

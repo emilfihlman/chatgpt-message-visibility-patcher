@@ -5,6 +5,10 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 operation=${1:---check}
+installed=false
+if [ "$(readlink -f -- "$0")" = /usr/local/bin/chatgpt-message-visibility ]; then installed=true; fi
+selection=/usr/local/lib/chatgpt-message-visibility/mode
+failure_file=/usr/local/lib/chatgpt-message-visibility/last-hook-failure
 hook=false
 if [ "$operation" = '--apt-hook' ]; then
   hook=true
@@ -15,13 +19,27 @@ fi
 if [ "$hook" = true ] && [ "$(dpkg-query -W '-f=${db:Status-Status}' chatgpt 2>/dev/null || :)" != installed ]; then
   exit 0
 fi
+record_hook_failure() (
+  [ "$installed" = true ] && [ "$(id -u)" = 0 ] || return 0
+  failure_temp=$(mktemp "${failure_file}.XXXXXX") || return 1
+  trap 'rm -f -- "$failure_temp"' EXIT HUP INT TERM
+  failed_mode=$(cat -- "$selection" 2>/dev/null || :)
+  case "$failed_mode" in messages|all) ;; *) failed_mode=unknown ;; esac
+  failed_version=$(dpkg-query -W '-f=${Version}' chatgpt 2>/dev/null || :)
+  {
+    printf 'Automatic reapplication failed on %s (ChatGPT %s, selected mode %s).\n' "$(date '+%Y-%m-%d %H:%M:%S %:z')" "${failed_version:-unknown}" "$failed_mode"
+    printf '%s\n' "$1" | head -c 8192
+    printf '\n%s\n' 'Update the patcher and run sudo chatgpt-message-visibility --apply to retry.'
+  } > "$failure_temp" || return 1
+  chown root:root "$failure_temp" && chmod 0644 "$failure_temp" &&
+    mv -f -- "$failure_temp" "$failure_file" || return 1
+  trap - EXIT HUP INT TERM
+)
 run_patch() {
   script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || return 1
   helper="$script_directory/patch-message-visibility.mjs"
-  installed=false
   if [ ! -f "$helper" ]; then
     helper=/usr/local/lib/chatgpt-message-visibility/patch-message-visibility.mjs
-    if [ "$(readlink -f -- "$0")" = /usr/local/bin/chatgpt-message-visibility ]; then installed=true; fi
   fi
   # Keep archive changes and the saved selection under the same writer lock.
   if [ "$operation" != --check ] && [ "$(id -u)" = 0 ]; then
@@ -31,7 +49,6 @@ run_patch() {
   save_mode=false
   if [ "$operation" = --apply ]; then
     shift
-    selection=/usr/local/lib/chatgpt-message-visibility/mode
     if [ "${1:-}" = --mode ]; then
       selected_mode=${2:-}
       # Leave argument validation to the helper before saving anything.
@@ -69,6 +86,7 @@ run_patch() {
       chown root:root "$selection_temp" && chmod 0644 "$selection_temp" &&
       mv -f -- "$selection_temp" "$selection" || return 1
     trap - EXIT HUP INT TERM
+    rm -f -- "$failure_file" || return 1
   fi
 }
 if [ "$hook" = true ]; then
@@ -78,9 +96,15 @@ if [ "$hook" = true ]; then
       *) printf '%s\n' "$output" ;;
     esac
   else
+    if ! record_hook_failure "$output"; then
+      printf '%s\n' 'Could not save the automatic reapplication failure status.' >&2
+    fi
     printf '%s\n' "ChatGPT message visibility patch skipped: $output" >&2
     printf '%s\n' 'APT can continue. Run chatgpt-message-visibility --check to inspect this build.' >&2
   fi
   exit 0
+fi
+if [ "$operation" = --check ] && [ "$#" -le 1 ] && [ "$installed" = true ] && [ -f "$failure_file" ]; then
+  cat -- "$failure_file" >&2 || :
 fi
 run_patch "$@"

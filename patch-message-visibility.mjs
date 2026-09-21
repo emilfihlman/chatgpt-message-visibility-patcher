@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: MIT
-// A narrow structural match tolerates names/hashes, not changed logic.
+// Narrow syntax matches tolerate names, asset moves and unrelated compiler changes.
 // Vendored Acorn verifies candidates are executable syntax, never examples in strings/comments.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -100,6 +100,223 @@ const PATCHED = {
   group: normalizedFunction(functionsFrom(groupReplacement(GROUP_EXAMPLE))[0]).fingerprint,
 };
 
+// Keep the upstream renderers and their state, memoization, summaries and props.
+// Match only the decisions that hide content; unrelated compiler changes do not
+// change these semantic anchors. The original generators above remain frozen for
+// restoring archives patched by older releases.
+const STRUCTURAL_MARKERS = MODE_MARKERS.map(marker => `${marker}:2`);
+const VISIBILITY_HELPER = `function mvVisibility(b,v,i,c,h,j){let s=new Set;for(let u of h??[]){if(u.kind==="standalone")s.add(u.item.item);else if(u.kind==="group")for(let e of u.items)s.add(e.item)}let p={...b,...v},w=p.wrapSearchableContent;function d(x,y){return j("div",{"data-message-visibility":y?"normally-collapsed":void 0,style:{opacity:y?.9:1},children:x})}p.wrapSearchableContent=e=>{let content=d(e.content,c&&s.has(e.item));return typeof w==="function"?w({...e,content}):content};if(p.subagentActivityContentByItemId instanceof Map){let m=new Map(p.subagentActivityContentByItemId);for(let e of s)if(e.type==="subagent-activity"&&m.has(e.id))m.set(e.id,d(m.get(e.id),c));p.subagentActivityContentByItemId=m}return[p,i==null?i:d(i,c)]}`;
+const HELPER_FINGERPRINT = normalizedFunction(functionsFrom(VISIBILITY_HELPER)[0]).fingerprint;
+
+function syntaxNodes(root) {
+  const nodes = [], pending = [root];
+  while (pending.length) {
+    const node = pending.pop();
+    nodes.push(node);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) {
+        for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
+      } else if (value && typeof value.type === 'string') pending.push(value);
+    }
+  }
+  return nodes;
+}
+
+function literal(node) {
+  if (node?.type === 'Literal') return node.value;
+  if (node?.type === 'TemplateLiteral' && !node.expressions.length) return node.quasis[0].value.cooked;
+}
+function propertyName(node) {
+  return node?.computed ? literal(node.key ?? node.property) : (node?.key ?? node?.property)?.name ?? literal(node?.key);
+}
+function member(node, name) {
+  return node?.type === 'MemberExpression' && propertyName(node) === name && node.object.type === 'Identifier';
+}
+function fields(node) {
+  if (!['ObjectExpression', 'ObjectPattern'].includes(node?.type)) return new Map();
+  return new Map(node.properties.filter(prop => prop.type === 'Property').map(prop => [propertyName(prop), prop.value]));
+}
+function jsxCall(node) {
+  if (node?.type !== 'CallExpression' || node.arguments.length < 2 || node.arguments[1].type !== 'ObjectExpression') return false;
+  const callee = node.callee.type === 'SequenceExpression' ? node.callee.expressions.at(-1) : node.callee;
+  return callee?.type === 'MemberExpression' && ['jsx', 'jsxs'].includes(propertyName(callee));
+}
+function one(nodes, predicate) {
+  const found = nodes.filter(predicate);
+  return found.length === 1 ? found[0] : null;
+}
+function nonNull(node, name) {
+  return node?.type === 'BinaryExpression' && node.operator === '!=' &&
+    node.left.type === 'Identifier' && (name == null || node.left.name === name) && literal(node.right) === null;
+}
+function markerStatement(node, marker) {
+  return node.body.body.some(statement => statement.type === 'ExpressionStatement' && literal(statement.expression) === marker);
+}
+function editNode(node, replacement) { return {start:node.start, end:node.end, text:replacement}; }
+
+function structuralTurn(node, text) {
+  const nodes = syntaxNodes(node);
+  const props = one(nodes, child => child.type === 'ObjectPattern' &&
+    ['agentActivityProps', 'visibleAgentActivityProps', 'inlineSubagentActivityContent', 'hasFinalAssistantStarted'].every(name => fields(child).has(name)));
+  if (!props) return null;
+  const propFields = fields(props);
+  const base = propFields.get('agentActivityProps'), visible = propFields.get('visibleAgentActivityProps');
+  if (base.type !== 'Identifier' || visible.type !== 'Identifier') return null;
+  const selection = one(nodes, child => child.type === 'ConditionalExpression' && member(child.test, 'isCollapsed') &&
+    member(child.consequent, 'collapsibleUnits') && member(child.alternate, 'expandedUnits') && child.consequent.object.name === child.alternate.object.name);
+  if (!selection) return null;
+  const parts = selection.consequent.object.name, state = selection.test.object.name;
+  const persistent = one(nodes, child => child.type === 'ConditionalExpression' && member(child.consequent, 'persistentUnits') &&
+    child.consequent.object.name === parts && child.alternate.type === 'ArrayExpression' && !child.alternate.elements.length &&
+    child.test.type === 'LogicalExpression' && child.test.operator === '&&' && nonNull(child.test.left, parts) &&
+    member(child.test.right, 'isCollapsed') && child.test.right.object.name === state);
+  const collapsed = one(nodes, child => child.type === 'VariableDeclarator' && child.id.type === 'Identifier' &&
+    child.init?.type === 'LogicalExpression' && child.init.operator === '&&' && member(child.init.right, 'isCollapsed') && child.init.right.object.name === state);
+  if (!persistent || !collapsed) return null;
+  const collapseName = collapsed.id.name;
+  const declaration = one(nodes, child => child.type === 'VariableDeclaration' && child.declarations.includes(collapsed));
+  const summary = one(nodes, child => jsxCall(child) && fields(child.arguments[1]).has('collapsedMessageCount') &&
+    fields(child.arguments[1]).get('isCollapsed')?.name === collapseName);
+  const body = one(nodes, child => child.type === 'ConditionalExpression' && child.test.type === 'LogicalExpression' && child.test.operator === '&&' &&
+    child.test.left.type === 'UnaryExpression' && child.test.left.operator === '!' && child.test.left.argument.name === collapseName &&
+    nonNull(child.test.right) && jsxCall(child.consequent) && literal(child.alternate) === null);
+  if (!declaration || !summary || !body) return null;
+  const bodyFields = fields(body.consequent.arguments[1]), animate = fields(bodyFields.get('animate'));
+  if (literal(bodyFields.get('className')) !== '-ms-2 ps-2' || literal(animate.get('height')) !== 'auto' || literal(animate.get('opacity')) !== 1 ||
+      bodyFields.get('initial')?.type !== 'ObjectExpression' || bodyFields.get('exit')?.type !== 'ObjectExpression') return null;
+  const entries = one(nodes, child => jsxCall(child) && child.arguments[1].properties.some(prop => prop.type === 'SpreadElement' && prop.argument.name === base.name) &&
+    child.arguments[1].properties.some(prop => prop.type === 'SpreadElement' && prop.argument.name === visible.name) && fields(child.arguments[1]).get('units')?.type === 'Identifier');
+  if (!entries || !one(nodes, child => child.type === 'AssignmentExpression' && child.operator === '=' && child.right === selection && child.left.name === fields(entries.arguments[1]).get('units').name)) return null;
+  const hidden = one(nodes, child => {
+    const value = child.type === 'VariableDeclarator' ? child.init : child.type === 'AssignmentExpression' ? child.right : null;
+    const memberNode = value?.left?.type === 'ChainExpression' ? value.left.expression : value?.left;
+    return value?.type === 'LogicalExpression' && value.operator === '??' && member(memberNode,'collapsibleUnits') &&
+      memberNode.object.name === parts && value.right.name === fields(entries.arguments[1]).get('units').name;
+  });
+  const hiddenName = hidden?.type === 'VariableDeclarator' ? hidden.id.name : hidden?.left.name;
+  // Older React Compiler output creates the partition inside a block and caches
+  // its hidden units separately. Use that outer cache, never a shadowed local.
+  if (!hiddenName || !node.body.body.some(statement => statement.type === 'VariableDeclaration' && statement.declarations.some(entry => entry.id.name === hiddenName))) return null;
+  const children = one(nodes, child => child.type === 'ArrayExpression' && child.elements.some(element => element?.type === 'ConditionalExpression' && element.consequent === entries));
+  const inline = children?.elements.at(-1);
+  if (inline?.type !== 'Identifier') return null;
+  // A future renderer moving the collapse computation after this content must be
+  // reviewed; injecting before it would invalidate React Compiler dependencies.
+  if (declaration.end >= entries.start || declaration.end >= body.start) return null;
+  if (nodes.some(child => child.type === 'Identifier' && /^mv[A-Z]/.test(child.name))) throw new Error('Renderer local binding conflicts with visibility patch; no changes.');
+  const runtime = (entries.callee.type === 'SequenceExpression' ? entries.callee.expressions.at(-1) : entries.callee).object;
+  const jsx = `${text.slice(runtime.start, runtime.end)}.jsx`;
+  return [
+    {start:node.body.start+1,end:node.body.start+1,text:`"${STRUCTURAL_MARKERS[0]}";`},
+    editNode(selection, `("message-visibility:units",${parts}.expandedUnits)`),
+    editNode(persistent, '("message-visibility:persistent",[])'),
+    {start:declaration.end,end:declaration.end,text:`${VISIBILITY_HELPER}[${visible.name},${inline.name}]=mvVisibility(${base.name},${visible.name},${inline.name},${collapseName},${hiddenName},${jsx});`},
+    editNode(body.test, `("message-visibility:body",${text.slice(body.test.right.start, body.test.right.end)})`),
+    editNode(bodyFields.get('initial'), '!1'),
+    editNode(bodyFields.get('exit'), 'void 0'),
+  ];
+}
+
+function structuralGroup(node, text) {
+  const nodes = syntaxNodes(node);
+  if (!one(nodes, child => child.type === 'ObjectPattern' && ['summary', 'summaryKey', 'summaryTransition', 'shouldAnimateInitialCollapse', 'canExpand', 'defaultExpanded', 'children'].every(name => fields(child).has(name)))) return null;
+  const body = one(nodes, child => child.type === 'ConditionalExpression' && child.test.type === 'LogicalExpression' && child.test.operator === '&&' &&
+    child.test.left.type === 'Identifier' && child.test.right.type === 'BinaryExpression' && child.test.right.operator === '!==' &&
+    child.test.right.left.type === 'Identifier' && literal(child.test.right.right) === 'collapsed' && jsxCall(child.consequent) && literal(child.alternate) === null);
+  if (!body) return null;
+  const props = fields(body.consequent.arguments[1]), animation = props.get('animate');
+  if (literal(props.get('className')) !== '-ms-2 ps-2' || animation?.type !== 'ConditionalExpression' || animation.test.type !== 'Identifier' ||
+      literal(fields(animation.consequent).get('opacity')) !== 1 || literal(fields(animation.consequent).get('height')) !== 'auto' ||
+      literal(fields(animation.alternate).get('opacity')) !== 0 || literal(fields(animation.alternate).get('height')) !== 0 ||
+      !props.has('onAnimationComplete') || !props.has('style') || !props.has('children')) return null;
+  const enabled = `${body.test.left.name}&&${animation.test.name}`;
+  const content = text.slice(props.get('children').start, props.get('children').end);
+  return [
+    {start:node.body.start+1,end:node.body.start+1,text:`"${STRUCTURAL_MARKERS[1]}";`},
+    editNode(body.test, '("message-visibility:group-body",true)'),
+    editNode(body.consequent.arguments[0], '"div"'),
+    editNode(body.consequent.arguments[1], `{className:"-ms-2 ps-2","data-message-visibility":${enabled}?void 0:"normally-collapsed",style:{opacity:${enabled}?1:.9},children:${content}}`),
+  ];
+}
+
+function inspectPatchedStructure(node, role) {
+  const nodes = syntaxNodes(node);
+  function markedExpression(marker, predicate) {
+    return one(nodes, child => child.type === 'SequenceExpression' && child.expressions.length === 2 &&
+      literal(child.expressions[0]) === marker && predicate(child.expressions[1]));
+  }
+  function isVoid(node) { return node?.type === 'UnaryExpression' && node.operator === 'void' && literal(node.argument) === 0; }
+  if (role === 'turn') {
+    const units = markedExpression('message-visibility:units', child => member(child, 'expandedUnits'));
+    const persistent = markedExpression('message-visibility:persistent', child => child.type === 'ArrayExpression' && !child.elements.length);
+    const content = markedExpression('message-visibility:body', child => nonNull(child));
+    if (!units || !persistent || !content) return false;
+    const body = one(nodes, child => child.type === 'ConditionalExpression' && child.test === content && jsxCall(child.consequent) && literal(child.alternate) === null);
+    if (!body) return false;
+    const props = fields(body.consequent.arguments[1]), initial = props.get('initial');
+    if (initial?.type !== 'UnaryExpression' || initial.operator !== '!' || literal(initial.argument) !== 1 || !isVoid(props.get('exit')) ||
+      literal(fields(props.get('animate')).get('height')) !== 'auto' || literal(fields(props.get('animate')).get('opacity')) !== 1) return false;
+    const helper = one(nodes, child => child.type === 'FunctionDeclaration' && child.id.name === 'mvVisibility');
+    if (!helper || normalizedFunction(helper).fingerprint !== HELPER_FINGERPRINT) return false;
+    const call = one(nodes, child => child.type === 'CallExpression' && child.callee.name === 'mvVisibility' && child.arguments.length === 6);
+    if (!call || call.arguments.slice(0,4).some(argument => argument.type !== 'Identifier')) return false;
+    if (call.arguments[4].type !== 'Identifier') return false;
+    const hiddenName = call.arguments[4].name;
+    const hidden = one(nodes, child => {
+      const value = child.type === 'VariableDeclarator' && child.id.name === hiddenName ? child.init :
+        child.type === 'AssignmentExpression' && child.left.name === hiddenName ? child.right : null;
+      const memberNode = value?.left?.type === 'ChainExpression' ? value.left.expression : value?.left;
+      return value?.type === 'LogicalExpression' && value.operator === '??' && member(memberNode,'collapsibleUnits') && memberNode.object.name === units.expressions[1].object.name;
+    });
+    if (!hidden) return false;
+    // The fourth argument is the normal collapse decision; all content stays
+    // mounted while this decision controls only the helper's visual cue.
+    const collapseName = call.arguments[3].name;
+    return !!one(nodes, child => jsxCall(child) && fields(child.arguments[1]).has('collapsedMessageCount') &&
+      fields(child.arguments[1]).get('isCollapsed')?.name === collapseName);
+  }
+  const content = markedExpression('message-visibility:group-body', child => literal(child) === true);
+  const body = one(nodes, child => child.type === 'ConditionalExpression' && child.test === content && jsxCall(child.consequent) && literal(child.alternate) === null);
+  if (!body || literal(body.consequent.arguments[0]) !== 'div') return false;
+  const props = fields(body.consequent.arguments[1]), opacity = fields(props.get('style')).get('opacity'), cue = props.get('data-message-visibility');
+  if (literal(props.get('className')) !== '-ms-2 ps-2' || !props.has('children') ||
+      opacity?.type !== 'ConditionalExpression' || literal(opacity.consequent) !== 1 || literal(opacity.alternate) !== .9 ||
+      cue?.type !== 'ConditionalExpression' || !isVoid(cue.consequent) || literal(cue.alternate) !== 'normally-collapsed') return false;
+  function sameDecision(left,right) {
+    return left.type === 'LogicalExpression' && right.type === 'LogicalExpression' && left.operator === '&&' && right.operator === '&&' &&
+      left.left.type === 'Identifier' && left.right.type === 'Identifier' && left.left.name === right.left.name && left.right.name === right.right.name;
+  }
+  return sameDecision(opacity.test,cue.test);
+}
+
+function inspectStructuralRenderer(declarations, text) {
+  const found = {turn:[],group:[]};
+  for (const node of declarations) {
+    for (const [index,role] of ['turn','group'].entries()) {
+      if (markerStatement(node, STRUCTURAL_MARKERS[index])) {
+        const nodes = syntaxNodes(node);
+        const required = role === 'turn' ? ['message-visibility:units', 'message-visibility:persistent', 'message-visibility:body'] : ['message-visibility:group-body'];
+        if (!required.every(marker => nodes.filter(child => literal(child) === marker).length === 1) ||
+            !inspectPatchedStructure(node,role)) {
+          throw new Error('Modified or incomplete structural visibility patch; no changes.');
+        }
+        found[role].push({role,status:'patched',start:node.start,end:node.end});
+      } else {
+        const edits = role === 'turn' ? structuralTurn(node,text) : structuralGroup(node,text);
+        if (edits) found[role].push({role,status:'original',start:node.start,end:node.end,edits});
+      }
+    }
+  }
+  if (!found.turn.length && !found.group.length) return {status:'unsupported'};
+  if (found.turn.length !== 1 || found.group.length !== 1) {
+    if ([...found.turn,...found.group].some(match => match.status === 'patched')) throw new Error('Incomplete or ambiguous structural renderer; no changes.');
+    return {status:'unsupported'};
+  }
+  const replacements = [found.turn[0],found.group[0]];
+  if (replacements[0].status !== replacements[1].status) throw new Error('Partially patched structural renderer; no changes.');
+  return {status:replacements[0].status,strategy:'structural',replacements};
+}
+
 export function inspectExpandedRenderer(source) {
   const text = source.toString('utf8');
   if (!Buffer.from(text).equals(source)) throw new Error('Renderer is not valid UTF-8.');
@@ -108,6 +325,8 @@ export function inspectExpandedRenderer(source) {
   let declarations;
   try { declarations = functionsFrom(text); }
   catch { throw new Error('Cannot parse candidate collapse renderer; no changes.'); }
+  const structural = inspectStructuralRenderer(declarations,text);
+  if (structural.status !== 'unsupported') return structural;
   const found = {turn:[],group:[]};
   for (const node of declarations) {
     const hasMarker = node.body.body.some(statement=>statement.type==='ExpressionStatement'&&MODE_MARKERS.includes(statement.expression?.value));
@@ -135,9 +354,32 @@ export function inspectExpandedRenderer(source) {
   return {status:replacements[0].status,replacements};
 }
 
-export function patchExpandedRenderer(source) {
-  const inspected=inspectExpandedRenderer(source);
+export function patchExpandedRenderer(source, legacy = false) {
+  let inspected=inspectExpandedRenderer(source);
+  if (legacy && inspected.status === 'original' && inspected.strategy === 'structural') {
+    const text = source.toString('utf8');
+    const replacements = [];
+    for (const node of functionsFrom(text)) {
+      const normalized = normalizedFunction(node);
+      for (const role of ['turn','group']) if (normalized.fingerprint === ORIGINAL[role].fingerprint) {
+        const bindings = Object.fromEntries(Object.entries(ORIGINAL[role].bindings).map(([key,index]) => [key,normalized.names[index]]));
+        bindings.jsx += '.jsx';
+        if (role === 'turn') bindings.fragment = bindings.jsx.slice(0,-4)+'.Fragment';
+        replacements.push({role,bindings,offset:Buffer.byteLength(text.slice(0,node.start)),length:Buffer.byteLength(text.slice(node.start,node.end))});
+      }
+    }
+    if (replacements.length !== 2) throw new Error('No legacy renderer match.');
+    inspected = {status:'original',replacements};
+  }
   if(inspected.status!=='original')throw new Error('Expected original turn and group collapse renderers.');
+  if (inspected.strategy === 'structural') {
+    let text = source.toString('utf8');
+    const edits = inspected.replacements.flatMap(replacement => replacement.edits).sort((a,b) => b.start-a.start);
+    for (const edit of edits) text = text.slice(0,edit.start)+edit.text+text.slice(edit.end);
+    const result = Buffer.from(text);
+    if (inspectExpandedRenderer(result).status !== 'patched') throw new Error('Structural renderer verification failed.');
+    return result;
+  }
   const result=Buffer.from(source);
   for(const replacement of inspected.replacements){
     if(Object.entries(replacement.bindings).some(([key,name])=>key!=="name"&&/^mv[A-Z]/.test(name)))throw new Error("Renderer dependency conflicts with generated local bindings; no changes.");
@@ -190,13 +432,13 @@ export function inspectBundle(source) {
   });
 }
 
-export function patchBundle(source, mode = 'messages') {
+export function patchBundle(source, mode = 'messages', legacy = false) {
   if (!['messages', 'all'].includes(mode)) throw new Error('Choose --mode messages or --mode all.');
   const matches = inspectBundle(source);
   if (matches.length !== 1) throw new Error(`Unsupported or ambiguous classifier (${matches.length} matches); no changes.`);
   const match = matches[0];
   if (match.status === 'patched') throw new Error('Renderer already keeps authored messages visible.');
-  if (mode === 'all') return patchExpandedRenderer(source);
+  if (mode === 'all') return patchExpandedRenderer(source, legacy);
   // The original visibility expression below is also offered under CC0-1.0;
   // recipients may choose MIT OR CC0-1.0 for that contribution (see LICENSE-CC0).
   const expression = `${match.item}.type===\x60assistant-message\x60||${match.item}.type===\x60user-message\x60`;
@@ -258,13 +500,31 @@ export function inspectArchive(buffer) {
   return { ...parsed, ...target };
 }
 
-export function patchArchive(buffer, mode = 'messages') {
+export function patchArchive(buffer, mode = 'messages', legacy = false) {
   const parsed = inspectArchive(buffer);
-  const patched = patchBundle(parsed.source, mode);
+  const patched = patchBundle(parsed.source, mode, legacy);
   const integrity = parsed.entry.integrity;
   integrity.hash = sha256(patched);
   integrity.blocks = [];
   for (let offset = 0; offset < patched.length; offset += integrity.blockSize) integrity.blocks.push(sha256(patched.subarray(offset, offset + integrity.blockSize)));
+  if (patched.length !== parsed.source.length) {
+    const change = patched.length-parsed.source.length;
+    parsed.entry.size = patched.length;
+    for (const file of parsed.files) if (file.start > parsed.start) file.entry.offset = String(Number(file.entry.offset)+change);
+    const header = Buffer.from(JSON.stringify(parsed.header));
+    // ASAR uses a Chromium pickle containing a padded string pickle. Keep packed
+    // contents byte-for-byte; only the target length and following offsets move.
+    const headerPickleSize = 4+4+header.length+((4-header.length%4)%4);
+    const preamble = Buffer.alloc(8+headerPickleSize);
+    preamble.writeUInt32LE(4,0);
+    preamble.writeUInt32LE(headerPickleSize,4);
+    preamble.writeUInt32LE(headerPickleSize-4,8);
+    preamble.writeUInt32LE(header.length,12);
+    header.copy(preamble,16);
+    const result = Buffer.concat([preamble,buffer.subarray(parsed.dataStart,parsed.start),patched,buffer.subarray(parsed.start+parsed.source.length)]);
+    inspectArchive(result);
+    return result;
+  }
   const header = Buffer.from(JSON.stringify(parsed.header));
   if (header.length !== parsed.headerLength) throw new Error('Unexpected ASAR header size change.');
   const result = Buffer.from(buffer);
@@ -328,10 +588,17 @@ function matchingBackup(archive, buffer, mode) {
     if (!name.startsWith(prefix) || !name.endsWith('.bak')) continue;
     const candidate = path.join(path.dirname(archive), name);
     const stat = fs.lstatSync(candidate);
-    if (!stat.isFile() || stat.size !== buffer.length) continue;
+    if (!stat.isFile()) continue;
     try {
       const original = fs.readFileSync(candidate);
-      if (sha256(patchArchive(original, mode)) === sha256(buffer)) matches.push({ backup: candidate, original });
+      for (const legacy of mode === 'all' ? [false,true] : [false]) {
+        try {
+          if (sha256(patchArchive(original, mode, legacy)) === sha256(buffer)) {
+            matches.push({ backup:candidate, original });
+            break;
+          }
+        } catch { /* A legacy generator applies only to its exact original. */ }
+      }
     } catch { /* Old or unrelated versions cannot authorize restore. */ }
   }
   if (!matches.length) throw new Error('No exact original backup matches this patched archive; restore refused.');
@@ -364,13 +631,13 @@ export function operate(mode, archive, version = 'manual', visibilityMode = 'mes
       syncDirectory(path.dirname(backup));
     }
     atomicWrite(archive, result, stat, currentHash);
-    return { ...report, status: 'patched', mode: visibilityMode, backup, archiveSha256: sha256(result), rendererSha256: sha256(inspectArchive(result).source), result: 'Applied. Reload or restart ChatGPT to activate.' };
+    return { ...report, status: 'patched', mode: visibilityMode, backup, archiveSha256: sha256(result), rendererSha256: sha256(inspectArchive(result).source), result: 'Applied. Restart ChatGPT to activate.' };
   }
   if (mode !== '--restore') throw new Error('Unknown operation.');
   if (parsed.status === 'unpatched') return { ...report, result: 'Original classifier present; no changes.' };
   const { backup, original } = matchingBackup(archive, buffer, parsed.mode);
   atomicWrite(archive, original, stat, currentHash);
-  return { ...report, status: 'unpatched', mode: 'original', backup, archiveSha256: sha256(original), rendererSha256: sha256(inspectArchive(original).source), result: 'Restored. Reload or restart ChatGPT to activate.' };
+  return { ...report, status: 'unpatched', mode: 'original', backup, archiveSha256: sha256(original), rendererSha256: sha256(inspectArchive(original).source), result: 'Restored. Restart ChatGPT to activate.' };
 }
 
 function main() {
