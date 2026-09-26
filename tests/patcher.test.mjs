@@ -85,6 +85,28 @@ function allModeRenderer()
 	`);
 }
 
+function variantModeRenderer()
+{
+	let source = allModeRenderer().toString().replace(
+		'let state = collapseState',
+		`let [animating,setAnimating] = reactRuntime.useState(false);
+		let pending = reactRuntime.useRef(false), revision = reactRuntime.useRef(0), bodyRef = reactRuntime.useRef(null), reduced = false;
+		let state = collapseState`);
+	source = source.replace('let collapsed = allowCollapse && state.isCollapsed;', `let collapsed = allowCollapse && state.isCollapsed;
+		reactRuntime.useLayoutEffect(()=>{if(collapsed){revision.current+=1;pending.current=!1}},[collapsed]);`);
+	return Buffer.from(source.replace(
+		'className:"-ms-2 ps-2",initial:{height:0,opacity:0},\n\t\t\t\tanimate:{height:"auto",opacity:1},exit:{height:0,opacity:0},',
+		`ref:bodyRef,className:"-ms-2 ps-2",style:{overflow:animating?"hidden":"visible"},
+				initial:animating?{height:0,opacity:0,transform:"translateY(-8px)"}:!1,
+				animate:"expanded",variants:{expanded:{height:"auto",opacity:1,transform:"translateY(0)"}},
+				onAnimationComplete:event=>{
+					if(event!=="expanded"||collapsed||(setAnimating(!1),!pending.current))return;
+					pending.current=!1;
+					let token=revision.current;
+					settled().then(()=>{revision.current===token&&bodyRef.current?.querySelector("[data-auto-review-denied]")?.scrollIntoView({block:"center",behavior:reduced?"instant":"smooth"})})
+				},exit:{height:0,opacity:0},`));
+}
+
 function integrity(source, blockSize = 97)
 {
 	let blocks = [];
@@ -380,6 +402,173 @@ test('all mode renders full turn and group content even when their saved state i
 	assert.equal(group.props.children, 'group content');
 	assert.equal(calls, 1);
 	assert.notEqual(group.props.style?.pointerEvents, 'none');
+});
+
+test('named animation variants keep content visible through repeated collapse changes', () =>
+{
+	let source = variantModeRenderer();
+	assert.notDeepEqual(source, allModeRenderer());
+	assert.equal(inspectBundle(source)[0].allSupported, true);
+	let patched = patchBundle(source, 'all');
+	assert.equal(inspectBundle(patched)[0].mode, 'all');
+	let item = {type:'ordinary-tool', text:'tool content'};
+	let units = [{kind:'standalone', item:{item}}];
+	let components = new Function('jsxRuntime', 'Motion', 'Fragment', 'Summary', 'Entries',
+		'makeUnits', 'collapseState', 'partitionUnits', 'animationState', 'reactRuntime',
+		`${patched.toString()}\nreturn {turnView,groupView};`)(
+		{jsx:(type, props) => ({type, props})}, {div:'motion-div'}, 'fragment', 'summary', 'entries',
+		() => units, props => ({isCollapsed:props.persistedCollapsed}),
+		() => ({expandedUnits:units, collapsibleUnits:units, persistentUnits:[]}), () => 'collapsed',
+		{useState:value => [value,()=>{}],useRef:value => ({current:value}),useLayoutEffect:()=>{}});
+	for (let collapsed of [true, false, true, false])
+	{
+		let tree = components.turnView({agentActivityProps:{}, persistedCollapsed:collapsed});
+		let body = tree.props.children.at(-1);
+		assert.equal(body.type, 'motion-div');
+		assert.equal(body.props.initial, false);
+		assert.equal(body.props.exit, undefined);
+		assert.equal(body.props.style.overflow, 'visible');
+		assert.equal(body.props.animate, 'expanded');
+		assert.deepEqual(body.props.variants.expanded, {height:'auto', opacity:1, transform:'translateY(0)'});
+		assert.equal(typeof body.props.onAnimationComplete, 'function');
+		let entries = body.props.children[0].props.children[0];
+		assert.deepEqual(entries.props.units, units);
+		assert.equal(entries.props.wrapSearchableContent({item,content:'tool content'}).props.style.opacity, collapsed ? 0.9 : 1);
+	}
+	withArchive(archiveFixture(source), archive =>
+	{
+		let original = fs.readFileSync(archive);
+		operate('--apply', archive, 'variant-build', 'all');
+		let first = fs.readFileSync(archive);
+		operate('--apply', archive, 'variant-build', 'all');
+		assert.deepEqual(fs.readFileSync(archive), first);
+		operate('--apply', archive, 'variant-build', 'messages');
+		operate('--apply', archive, 'variant-build', 'all');
+		assert.deepEqual(fs.readFileSync(archive), first);
+		operate('--restore', archive);
+		assert.deepEqual(fs.readFileSync(archive), original);
+	});
+});
+
+test('unresolved or hiding animation variants fail without changing the archive', () =>
+{
+	let source = variantModeRenderer().toString();
+	let changes = [
+		['animate:"expanded"', 'animate:variantName'],
+		['animate:"expanded"', 'animate:"missing"'],
+		['variants:{expanded:', 'variants:{other:'],
+		['variants:{expanded:', 'variants:{...unknownVariants,expanded:'],
+		['variants:{expanded:{', 'variants:{expanded:{...unknownTarget,'],
+		['height:"auto",opacity:1,transform:"translateY(0)"', 'height:0,opacity:1,transform:"translateY(0)"'],
+		['height:"auto",opacity:1,transform:"translateY(0)"', 'height:"auto",opacity:0,transform:"translateY(0)"'],
+		['height:"auto",opacity:1,transform:"translateY(0)"', 'height:"auto",opacity:1,transform:"translateY(-8px)"'],
+		['overflow:animating?', 'overflow:other?'],
+	];
+	for (let [from, to] of changes)
+	{
+		let changed = Buffer.from(source.replace(from, to));
+		assert.notEqual(changed.toString(), source);
+		assert.equal(inspectExpandedRenderer(changed).status, 'unsupported');
+		withArchive(archiveFixture(changed), (archive, directory) =>
+		{
+			let original = fs.readFileSync(archive);
+			assert.throws(() => operate('--apply', archive, 'unsupported-variant', 'all'), /original|unsupported/i);
+			assert.deepEqual(fs.readFileSync(archive), original);
+			assert.deepEqual(fs.readdirSync(directory), ['app.asar']);
+		});
+	}
+	let patched = patchBundle(Buffer.from(source), 'all').toString();
+	for (let changed of [
+		patched.replace('animate:"expanded"', 'animate:"missing"'),
+		patched.replace('overflow:"visible"', 'overflow:"hidden"'),
+		patched.replace('height:"auto",opacity:1,transform:"translateY(0)"', 'height:0,opacity:1,transform:"translateY(0)"'),
+	])
+		assert.throws(() => inspectExpandedRenderer(Buffer.from(changed)), /modified|incomplete/i);
+});
+
+test('unknown completion callbacks, late captures and inconsistent hooks are refused', () =>
+{
+	const source = variantModeRenderer().toString();
+	const changes = [
+		['revision.current===token', 'revision.current!==token'],
+		['pending.current=!1;', 'pending.current=!0;'],
+		['setAnimating(!1)', 'setAnimating(!0)'],
+		['event!=="expanded"', 'event!=="other"'],
+		['ref:bodyRef', 'ref:otherRef'],
+		['reactRuntime.useLayoutEffect(', 'otherRuntime.useLayoutEffect('],
+		['revision = reactRuntime.useRef(0)', 'otherRevision = reactRuntime.useRef(0)'],
+		['let count = hiddenUnits.reduce', 'let settled = laterHelper; let count = hiddenUnits.reduce'],
+	];
+	for (const [from,to] of changes)
+	{
+		const changed = Buffer.from(source.replace(from,to));
+		assert.notEqual(changed.toString(),source);
+		assert.equal(inspectExpandedRenderer(changed).status,'unsupported');
+		assert.throws(() => patchBundle(changed,'all'), /original|unsupported/i);
+	}
+	const patched = patchBundle(Buffer.from(source),'all').toString();
+	const marker = '"message-visibility:review-complete";';
+	for (const [from,to] of [
+		[marker,''],
+		[marker,marker+marker],
+		['})("expanded")},[collapsed]);','})("expanded")},[]);'],
+		['})("expanded")},[collapsed]);','})("other")},[collapsed]);'],
+		['revision.current===token','revision.current!==token'],
+		['reactRuntime.useLayoutEffect(()=>{'+marker,'otherRuntime.useLayoutEffect(()=>{'+marker],
+		['reactRuntime.useLayoutEffect(()=>{'+marker,'false&&reactRuntime.useLayoutEffect(()=>{'+marker],
+	])
+	{
+		const changed = patched.replace(from,to);
+		assert.notEqual(changed,patched);
+		assert.throws(() => inspectExpandedRenderer(Buffer.from(changed)), /modified|incomplete/i);
+	}
+});
+
+test('completion effect preserves review jumps, cancellation and duplicate guards', async () =>
+{
+	const patched = patchBundle(variantModeRenderer(),'all');
+	const refs = [], previous = [], effects = [], jumps = [];
+	let refIndex = 0, effectIndex = 0, settle;
+	const runtime = {
+		useState:value => [value,()=>{}],
+		useRef:value => refs[refIndex++] ?? (refs[refIndex-1] = {current:value}),
+		useLayoutEffect:(effect,deps) => {
+			const index = effectIndex++;
+			if (!previous[index] || deps.some((value,position) => value !== previous[index][position])) effects.push(effect);
+			previous[index] = deps;
+		},
+	};
+	const item = {type:'tool'}, units = [{kind:'standalone',item:{item}}];
+	const turn = new Function('jsxRuntime','Motion','Fragment','Summary','Entries','makeUnits','collapseState','partitionUnits','reactRuntime','settled',
+		`${patched.toString()}\nreturn turnView;`)(
+		{jsx:(type,props) => ({type,props})},{div:'motion-div'},'fragment','summary','entries',()=>units,
+		props => ({isCollapsed:props.persistedCollapsed}),()=>({expandedUnits:units,collapsibleUnits:units,persistentUnits:[]}),runtime,
+		() => new Promise(resolve => {settle = resolve;}));
+	function render(collapsed)
+	{
+		refIndex = 0; effectIndex = 0;
+		const tree = turn({agentActivityProps:{},persistedCollapsed:collapsed});
+		refs[2].current = {querySelector:() => ({scrollIntoView:options => jumps.push(options)})};
+		for (const effect of effects.splice(0)) effect();
+		return tree.props.children.at(-1).props.onAnimationComplete;
+	}
+	render(true);
+	render(false);
+	assert.equal(settle,undefined,'ordinary expansion does not schedule a jump');
+	render(true);
+	refs[0].current = true;
+	const complete = render(false);
+	complete('expanded');
+	settle(); await Promise.resolve();
+	assert.deepEqual(jumps,[{block:'center',behavior:'smooth'}]);
+	complete('expanded'); await Promise.resolve();
+	assert.equal(jumps.length,1,'animation callback cannot duplicate a handled review jump');
+	render(true);
+	refs[0].current = true;
+	render(false);
+	render(true);
+	settle(); await Promise.resolve();
+	assert.equal(jumps.length,1,'collapsing cancels a delayed review jump');
 });
 
 test('all-mode source and marker examples in strings or comments are ignored', () =>

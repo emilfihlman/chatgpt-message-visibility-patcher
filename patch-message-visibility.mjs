@@ -154,6 +154,110 @@ function markerStatement(node, marker) {
 }
 function editNode(node, replacement) { return {start:node.start, end:node.end, text:replacement}; }
 
+function expandedTurnAnimation(props)
+{
+	const animate = props.get('animate');
+	// Newer builds name an inline variant instead of passing its target directly.
+	// Resolve only a literal name in this element's own variants object.
+	const target = animate?.type === 'ObjectExpression' ? animate :
+		typeof literal(animate) === 'string' ? fields(props.get('variants')).get(literal(animate)) : null;
+	if (typeof literal(animate) === 'string')
+	{
+		for (const object of [props.get('variants'), target])
+			if (object?.type !== 'ObjectExpression' || object.properties.some(property => property.type !== 'Property' || property.computed)) return false;
+	}
+	const values = fields(target);
+	return literal(values.get('height')) === 'auto' && literal(values.get('opacity')) === 1 &&
+		(animate?.type === 'ObjectExpression' || literal(values.get('transform')) === 'translateY(0)');
+}
+
+function originalTurnInitial(node)
+{
+	if (node?.type === 'ObjectExpression') return true;
+	return node?.type === 'ConditionalExpression' && node.test.type === 'Identifier' &&
+		node.consequent.type === 'ObjectExpression' && literal(fields(node.consequent).get('opacity')) === 0 &&
+		node.alternate.type === 'UnaryExpression' && node.alternate.operator === '!' && literal(node.alternate.argument) === 1;
+}
+
+// Match only this leaf completion contract, including the pending request and
+// cancellation guards. Keep the application's own callback text when invoking it
+// after a render, since a permanently mounted body has no new animation to end.
+const TURN_COMPLETION = normalizedFunction(parse(`event=>{
+	if(event!=="expanded"||collapsed||(setAnimating(!1),!pending.current))return;
+	pending.current=!1;
+	let token=revision.current;
+	settled().then(()=>{revision.current===token&&body.current?.querySelector("[data-auto-review-denied]")?.scrollIntoView({block:"center",behavior:reduced?"instant":"smooth"})})
+}`, {ecmaVersion:'latest'}).body[0].expression);
+const COMPLETION_MARKER = 'message-visibility:review-complete';
+
+function bindingNames(pattern)
+{
+	if (!pattern) return [];
+	if (pattern.type === 'Identifier') return [pattern.name];
+	if (pattern.type === 'ArrayPattern') return pattern.elements.flatMap(bindingNames);
+	if (pattern.type === 'ObjectPattern') return pattern.properties.flatMap(property => bindingNames(property.value ?? property.argument));
+	if (pattern.type === 'AssignmentPattern') return bindingNames(pattern.left);
+	if (pattern.type === 'RestElement') return bindingNames(pattern.argument);
+	return [];
+}
+
+function hookMember(call)
+{
+	if (call?.type !== 'CallExpression') return null;
+	const callee = call.callee.type === 'SequenceExpression' ? call.callee.expressions.at(-1) : call.callee;
+	return callee?.type === 'MemberExpression' && callee.object.type === 'Identifier' ? callee : null;
+}
+
+function turnCompletion(node, props, collapseName, before)
+{
+	const callback = props.get('onAnimationComplete');
+	if (literal(props.get('animate')) !== 'expanded' || callback?.type !== 'ArrowFunctionExpression') return null;
+	const normalized = normalizedFunction(callback);
+	if (normalized.fingerprint !== TURN_COMPLETION.fingerprint) return null;
+	const names = Object.fromEntries(TURN_COMPLETION.names.map((name,index) => [name,normalized.names[index]]));
+	if (names.collapsed !== collapseName || props.get('ref')?.name !== names.body) return null;
+	const nodes = syntaxNodes(node);
+	const hooks = nodes.map(hookMember).filter(callee => callee && ['useState','useRef','useLayoutEffect'].includes(propertyName(callee)));
+	if (!hooks.some(callee => propertyName(callee) === 'useLayoutEffect') || new Set(hooks.map(callee => callee.object.name)).size !== 1) return null;
+	const runtime = hooks[0].object.name;
+	const declarations = node.body.body.filter(statement => statement.type === 'VariableDeclaration').flatMap(statement => statement.declarations);
+	for (const name of ['collapsed','setAnimating','pending','revision','body','reduced'])
+	{
+		const declaration = one(declarations, entry => bindingNames(entry.id).includes(names[name]));
+		if (!declaration || declaration.end > before) return null;
+	}
+	// The settling helper may be imported. A local binding must already exist at
+	// the insertion point; moving a block-scoped or later binding is unsafe.
+	const settledBindings = nodes.filter(child => child.type === 'VariableDeclarator' && bindingNames(child.id).includes(names.settled));
+	if (settledBindings.some(entry => !declarations.includes(entry) || entry.end > before)) return null;
+	const setter = one(declarations, entry => entry.id.type === 'ArrayPattern' && entry.id.elements[1]?.name === names.setAnimating);
+	const stateHook = hookMember(setter?.init);
+	if (setter?.id.elements[0]?.type !== 'Identifier' || !stateHook || propertyName(stateHook) !== 'useState' || stateHook.object.name !== runtime) return null;
+	return {callback,names,runtime,animationState:setter.id.elements[0].name};
+}
+
+function completionEffect(node, props, collapseName)
+{
+	const nodes = syntaxNodes(node);
+	if (nodes.filter(child => literal(child) === COMPLETION_MARKER).length !== 1) return false;
+	const marker = one(nodes, child => child.type === 'ExpressionStatement' && literal(child.expression) === COMPLETION_MARKER);
+	const effect = marker && one(nodes, child => child.type === 'ArrowFunctionExpression' && child.params.length === 0 &&
+		child.body.type === 'BlockStatement' && child.body.body.length === 2 && child.body.body[0] === marker);
+	const call = effect && one(nodes, child => child.type === 'CallExpression' && child.arguments[0] === effect && child.arguments.length === 2);
+	if (!call) return false;
+	const position = node.body.body.findIndex(statement => statement.type === 'ExpressionStatement' && statement.expression === call);
+	const previous = node.body.body[position-1];
+	if (previous?.type !== 'VariableDeclaration' || !previous.declarations.some(entry => entry.id.name === collapseName)) return false;
+	const completion = turnCompletion(node, props, collapseName, call.start), callee = hookMember(call);
+	const invoke = effect.body.body[1]?.expression, dependencies = call.arguments[1];
+	if (!completion || callee?.object.name !== completion.runtime || propertyName(callee) !== 'useLayoutEffect' ||
+		dependencies.type !== 'ArrayExpression' || dependencies.elements.length !== 1 || dependencies.elements[0]?.name !== collapseName ||
+		invoke?.type !== 'CallExpression' || invoke.arguments.length !== 1 || literal(invoke.arguments[0]) !== 'expanded' ||
+		invoke.callee.type !== 'ArrowFunctionExpression') return false;
+	const copied = normalizedFunction(invoke.callee), original = normalizedFunction(completion.callback);
+	return copied.fingerprint === original.fingerprint && JSON.stringify(copied.names) === JSON.stringify(original.names);
+}
+
 function structuralTurn(node, text) {
   const nodes = syntaxNodes(node);
   const props = one(nodes, child => child.type === 'ObjectPattern' &&
@@ -181,9 +285,23 @@ function structuralTurn(node, text) {
     child.test.left.type === 'UnaryExpression' && child.test.left.operator === '!' && child.test.left.argument.name === collapseName &&
     nonNull(child.test.right) && jsxCall(child.consequent) && literal(child.alternate) === null);
   if (!declaration || !summary || !body) return null;
-  const bodyFields = fields(body.consequent.arguments[1]), animate = fields(bodyFields.get('animate'));
-  if (literal(bodyFields.get('className')) !== '-ms-2 ps-2' || literal(animate.get('height')) !== 'auto' || literal(animate.get('opacity')) !== 1 ||
-      bodyFields.get('initial')?.type !== 'ObjectExpression' || bodyFields.get('exit')?.type !== 'ObjectExpression') return null;
+  const bodyFields = fields(body.consequent.arguments[1]);
+  if (literal(bodyFields.get('className')) !== '-ms-2 ps-2' || !expandedTurnAnimation(bodyFields) ||
+      !originalTurnInitial(bodyFields.get('initial')) || bodyFields.get('exit')?.type !== 'ObjectExpression') return null;
+  const animationEdits = [];
+  let completionHook = '';
+  if (typeof literal(bodyFields.get('animate')) === 'string') {
+    const initial = bodyFields.get('initial'), overflow = fields(bodyFields.get('style')).get('overflow');
+    const completion = turnCompletion(node, bodyFields, collapseName, declaration.end);
+    if (initial.type !== 'ConditionalExpression' || overflow?.type !== 'ConditionalExpression' ||
+        overflow.test.type !== 'Identifier' || overflow.test.name !== initial.test.name ||
+        literal(overflow.consequent) !== 'hidden' || literal(overflow.alternate) !== 'visible' ||
+        !completion || initial.test.name !== completion.animationState) return null;
+    // The body now stays mounted. A repeated expand can set the upstream animation
+    // flag without changing its target, so no completion callback may clear it.
+    animationEdits.push(editNode(overflow, '"visible"'));
+    completionHook = `${completion.runtime}.useLayoutEffect(()=>{"${COMPLETION_MARKER}";(${text.slice(completion.callback.start,completion.callback.end)})("expanded")},[${collapseName}]);`;
+  }
   const entries = one(nodes, child => jsxCall(child) && child.arguments[1].properties.some(prop => prop.type === 'SpreadElement' && prop.argument.name === base.name) &&
     child.arguments[1].properties.some(prop => prop.type === 'SpreadElement' && prop.argument.name === visible.name) && fields(child.arguments[1]).get('units')?.type === 'Identifier');
   if (!entries || !one(nodes, child => child.type === 'AssignmentExpression' && child.operator === '=' && child.right === selection && child.left.name === fields(entries.arguments[1]).get('units').name)) return null;
@@ -210,10 +328,11 @@ function structuralTurn(node, text) {
     {start:node.body.start+1,end:node.body.start+1,text:`"${STRUCTURAL_MARKERS[0]}";`},
     editNode(selection, `("message-visibility:units",${parts}.expandedUnits)`),
     editNode(persistent, '("message-visibility:persistent",[])'),
-    {start:declaration.end,end:declaration.end,text:`${VISIBILITY_HELPER}[${visible.name},${inline.name}]=mvVisibility(${base.name},${visible.name},${inline.name},${collapseName},${hiddenName},${jsx});`},
+    {start:declaration.end,end:declaration.end,text:`${completionHook}${VISIBILITY_HELPER}[${visible.name},${inline.name}]=mvVisibility(${base.name},${visible.name},${inline.name},${collapseName},${hiddenName},${jsx});`},
     editNode(body.test, `("message-visibility:body",${text.slice(body.test.right.start, body.test.right.end)})`),
     editNode(bodyFields.get('initial'), '!1'),
     editNode(bodyFields.get('exit'), 'void 0'),
+    ...animationEdits,
   ];
 }
 
@@ -255,7 +374,8 @@ function inspectPatchedStructure(node, role) {
     if (!body) return false;
     const props = fields(body.consequent.arguments[1]), initial = props.get('initial');
     if (initial?.type !== 'UnaryExpression' || initial.operator !== '!' || literal(initial.argument) !== 1 || !isVoid(props.get('exit')) ||
-      literal(fields(props.get('animate')).get('height')) !== 'auto' || literal(fields(props.get('animate')).get('opacity')) !== 1) return false;
+      !expandedTurnAnimation(props)) return false;
+    if (typeof literal(props.get('animate')) === 'string' && literal(fields(props.get('style')).get('overflow')) !== 'visible') return false;
     const helper = one(nodes, child => child.type === 'FunctionDeclaration' && child.id.name === 'mvVisibility');
     if (!helper || normalizedFunction(helper).fingerprint !== HELPER_FINGERPRINT) return false;
     const call = one(nodes, child => child.type === 'CallExpression' && child.callee.name === 'mvVisibility' && child.arguments.length === 6);
@@ -272,6 +392,8 @@ function inspectPatchedStructure(node, role) {
     // The fourth argument is the normal collapse decision; all content stays
     // mounted while this decision controls only the helper's visual cue.
     const collapseName = call.arguments[3].name;
+    if (typeof literal(props.get('animate')) === 'string' && !completionEffect(node, props, collapseName)) return false;
+    if (props.get('animate')?.type === 'ObjectExpression' && nodes.some(child => literal(child) === COMPLETION_MARKER)) return false;
     return !!one(nodes, child => jsxCall(child) && fields(child.arguments[1]).has('collapsedMessageCount') &&
       fields(child.arguments[1]).get('isCollapsed')?.name === collapseName);
   }

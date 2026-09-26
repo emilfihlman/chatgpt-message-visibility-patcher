@@ -41,6 +41,13 @@ function changes no longer invalidate the whole renderer match. Unknown or
 ambiguous collapse logic is still left untouched; future builds can still need
 an updated patcher.
 
+The September 24 builds use a named animation variant for the turn body. The
+patcher resolves that variant only when its visible target is defined inline,
+and keeps overflow visible across repeated collapse/expand clicks. Existing
+hooks, review controls, and animation callbacks remain in place. A verified
+completion callback also runs after collapse state changes so review-denial
+navigation still works when no new animation completes.
+
 If automatic reapplication fails, the helper saves a bounded diagnostic locally.
 `--check` displays that warning on stderr alongside its normal JSON stdout,
 including the package version and selected mode. Updating the patcher and
@@ -82,17 +89,29 @@ sh test-launcher.sh
 
 These cover classifier matching, misleading strings/comments, archive integrity,
 unrelated file preservation, exact-backup restoration, mode switching, and
-automatic-hook failure reporting. Test fixtures contain no app bundles or
-conversation data.
+automatic-hook failure reporting. Named animation variants also cover repeated
+collapse changes, unresolved or hiding targets, completion-callback matching, and
+modified patches. Test fixtures contain no app bundles or conversation data.
 
-Validated against installed build **26.915.31945** and the original archive from
-**26.901.51231**: unrelated packed files remain byte-for-byte identical and both
-new and previously published patches restore their exact original backups.
-Browser checks of the extracted current turn, classifier, partition, state, and
-group functions reproduce the original hiding and verify patched visibility,
-ordering, dimming, and DOM/input/focus preservation. These component checks use
-synthetic leaf renderers and providers; they do not constitute a complete desktop
-end-to-end test.
+Validated offline against the **26.924.20706** and **26.924.22138** package archives
+in both modes: patched JavaScript parses, ASAR integrity checks pass, and all
+unrelated packed files remain byte-for-byte identical. The updated patcher also
+reproduces the existing **26.917.71314** all-mode archive exactly, preserving
+matching-backup compatibility. Earlier validation covered **26.915.31945** and
+**26.901.51231**, including restoration of previously published patches.
+Headless browser checks of the extracted **26.924.22138** turn and group functions
+with React **19.3.0** and Motion **12.43.0** reproduce the original hiding and verify
+patched visibility, ordering, dimming, and DOM/input/focus/selection/scroll
+preservation across repeated updates and toggles. Review-navigation checks cover
+the preserved completion callback and cancellation guards. These component checks
+use synthetic leaf renderers and providers and separately installed browser-test
+dependencies; they do not constitute a complete desktop end-to-end test.
+
+As of **2026-09-27**, the official Linux stable feed offers **26.924.22138**, but
+the separate [task-startup regression](https://github.com/openai/codex/issues/48189)
+still has reports affecting that build and no confirmed fixed release. Patcher
+compatibility does not establish that task startup works. Offline archive and
+component testing does not require upgrading or restarting the desktop app.
 
 ## Why the September update broke the old patch
 
@@ -103,6 +122,12 @@ memoization. The APT hook ran, but the old matcher refused the new function, so
 the freshly installed app retained its original message-hiding behavior.
 The message-only classifier still matched. The updated structural edits avoid
 replacing those evolving renderer functions.
+
+Builds **26.924.20706** and **26.924.22138** changed the turn body's inline animation
+target to `animate:"expanded"` with an inline `variants.expanded` target and a
+conditional initial animation. That made the previous structural matcher report
+`allSupported:false`. The matcher now verifies this additional shape and disables
+its animation-dependent overflow clipping while keeping the body mounted.
 
 ## Undo
 
