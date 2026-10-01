@@ -17,12 +17,13 @@ import {
 	sha256,
 } from '../patch-message-visibility.mjs';
 
-function classifier(name = 'keepUnit')
+function classifier(name = 'keepUnit', assistantGuard = false)
 {
+	let guardedAssistant = assistantGuard ? 'item.type === "assistant-message" && finalAssistant(item) || ' : '';
 	return `function ${name}({unit:unit,keepMcpAppEntriesPersistent:keep,mcpServerStatuses:statuses,renderMcpApps:render}) {
 		if (unit.kind !== "standalone") return !1;
 		let item = unit.item.item;
-		return item.type === "dynamic-tool-call" && dynamic(item) || keep && render && item.type === "mcp-tool-call" && mcp({item:item,mcpServerStatuses:statuses}) ? !0 :
+		return ${guardedAssistant}item.type === "dynamic-tool-call" && dynamic(item) || keep && render && item.type === "mcp-tool-call" && mcp({item:item,mcpServerStatuses:statuses}) ? !0 :
 			item.type === "user-message" && (item.steeringStatus != null || item.hookFeedback === !0);
 	}`;
 }
@@ -107,6 +108,22 @@ function variantModeRenderer()
 				},exit:{height:0,opacity:0},`));
 }
 
+function preloadModeRenderer()
+{
+	let source = variantModeRenderer().toString()
+		.replace('keepMcpAppEntriesPersistent:keep,parts', 'keepMcpAppEntriesPersistent:keep,hovered,parts')
+		.replace('let [animating,setAnimating]', 'let [closing,setClosing] = reactRuntime.useState(false);\n\t\tlet [animating,setAnimating]')
+		.replace('let bodyUnits = [], persistent = [], hiddenUnits;', 'let bodyUnits = [], persistent = [], hiddenUnits, preToggle = [];')
+		.replace('hiddenUnits = parts?.collapsibleUnits ?? bodyUnits;', 'hiddenUnits = parts?.collapsibleUnits ?? bodyUnits;\n\t\t\tpreToggle = parts?.preToggleUnits ?? [];')
+		.replace('jsxRuntime.jsx(Summary, {collapsedMessageCount:count', 'preToggle.length ? jsxRuntime.jsx(Entries, {...base,units:preToggle}) : null,\n\t\t\tjsxRuntime.jsx(Summary, {collapsedMessageCount:count')
+		.replace('!collapsed && body != null', '(hovered || !collapsed) && body != null')
+		.replace('className:"-ms-2 ps-2",style:{overflow:animating?', 'className:classNames("-ms-2 ps-2",collapsed&&!closing&&"invisible"),inert:collapsed,style:{overflow:collapsed||animating?')
+		.replace('initial:animating?{height:0,opacity:0,transform:"translateY(-8px)"}:!1', 'initial:animating?{height:reduced?"auto":0,opacity:0,transform:reduced?"translateY(0)":"translateY(-8px)"}:!1')
+		.replace('animate:"expanded",variants:{expanded:', 'animate:collapsed?"preloaded":"expanded",variants:{preloaded:{height:reduced&&closing?"auto":0,opacity:0,transform:reduced?"translateY(0)":"translateY(-8px)"},expanded:')
+		.replace('onAnimationComplete:event=>{', 'onAnimationComplete:event=>{\n\t\t\t\t\tif(event==="preloaded"&&collapsed){setClosing(!1);return}');
+	return Buffer.from(source);
+}
+
 function integrity(source, blockSize = 97)
 {
 	let blocks = [];
@@ -181,6 +198,43 @@ test('authored messages remain persistent while original tool decisions are pres
 	assert.equal(run({type:'mcp-tool-call'}), false);
 	assert.equal(run({type:'ordinary-tool'}), false);
 	assert.equal(select({unit:{kind:'group'}}), false);
+});
+
+test('new guarded assistant branch is preserved while remaining authored messages become persistent', () =>
+{
+	let source = Buffer.from(classifier('keepUnit', true));
+	assert.equal(inspectBundle(source)[0].mode, 'original');
+	let original = new Function('dynamic', 'mcp', 'finalAssistant', `${source.toString()}\nreturn keepUnit;`)(() => true, () => true, item => item.phase === 'final_answer');
+	let originalRun = item => original({unit:{kind:'standalone',item:{item}}});
+	assert.equal(originalRun({type:'assistant-message',phase:'final_answer'}), true);
+	assert.equal(originalRun({type:'assistant-message',phase:'commentary'}), false);
+	let patched = patchBundle(source);
+	assert.equal(inspectBundle(patched)[0].mode, 'messages');
+	assert.equal(patched.length, source.length);
+	assert.match(patched.toString(), /item\.type === "assistant-message" && finalAssistant\(item\) \|\|/);
+	let select = new Function('dynamic', 'mcp', 'finalAssistant', `${patched.toString()}\nreturn keepUnit;`)(() => true, () => true, () => false);
+	let run = (item, options = {}) => select({unit:{kind:'standalone',item:{item}},...options});
+	assert.equal(run({type:'assistant-message',phase:'commentary'}), true);
+	assert.equal(run({type:'user-message'}), true);
+	assert.equal(run({type:'dynamic-tool-call'}), true);
+	assert.equal(run({type:'mcp-tool-call'}, {keepMcpAppEntriesPersistent:true,renderMcpApps:true}), true);
+	assert.equal(run({type:'mcp-tool-call'}), false);
+	assert.equal(run({type:'ordinary-tool'}), false);
+});
+
+test('guarded classifier rejects altered assistant or tool decisions and mixed duplicates', () =>
+{
+	let guarded = classifier('guarded', true);
+	for (let changed of [
+		guarded.replace('finalAssistant(item)', 'finalAssistant(unit)'),
+		guarded.replace('item.type === "assistant-message"', 'item.type === "ordinary-tool"'),
+		guarded.replace('item.type === "dynamic-tool-call"', 'item.type === "ordinary-tool"'),
+		guarded.replace('item.type === "mcp-tool-call"', 'item.type === "ordinary-tool"'),
+	])
+		assert.deepEqual(inspectBundle(Buffer.from(changed)), []);
+	let ambiguous = Buffer.from(classifier('old') + '\n' + guarded);
+	assert.equal(inspectBundle(ambiguous).length, 2);
+	assert.throws(() => patchBundle(ambiguous), /ambiguous/i);
 });
 
 test('function examples in strings and comments are not executable candidates', () =>
@@ -450,6 +504,109 @@ test('named animation variants keep content visible through repeated collapse ch
 	});
 });
 
+test('hover preloading stays visible and interactive while leading transcript appears once', () =>
+{
+	const source = preloadModeRenderer();
+	assert.equal(inspectExpandedRenderer(source).status, 'original');
+	const patched = patchBundle(source, 'all');
+	assert.equal(inspectExpandedRenderer(patched).status, 'patched');
+	const leading = {kind:'standalone',item:{item:{type:'realtime-transcript'}}};
+	const hidden = {kind:'standalone',item:{item:{type:'ordinary-tool'}}};
+	const persistent = {kind:'standalone',item:{item:{type:'user-message'}}};
+	const refs = [], previous = [], effects = [], states = [false,false];
+	let stateIndex = 0, refIndex = 0, effectIndex = 0;
+	const runtime = {
+		useState:() => {
+			const index = stateIndex++;
+			return [states[index], value => {states[index] = value;}];
+		},
+		useRef:value => refs[refIndex++] ?? (refs[refIndex-1] = {current:value}),
+		useLayoutEffect:(effect,deps) => {
+			const index = effectIndex++;
+			if (!previous[index] || deps.some((value,position) => value !== previous[index][position])) effects.push(effect);
+			previous[index] = deps;
+		},
+	};
+	const turn = new Function('jsxRuntime','Motion','Fragment','Summary','Entries','makeUnits','collapseState','partitionUnits','reactRuntime',
+		`${patched.toString()}\nreturn turnView;`)(
+		{jsx:(type,props) => ({type,props})},{div:'motion-div'},'fragment','summary','entries',()=>[leading,hidden,persistent],
+		props => ({isCollapsed:props.persistedCollapsed}),
+		()=>({expandedUnits:[hidden,persistent],collapsibleUnits:[hidden],persistentUnits:[persistent],preToggleUnits:[leading]}),runtime);
+	for (const [collapsed,hovered] of [[true,false],[true,true],[false,false],[false,true],[true,true],[false,true]])
+	{
+		stateIndex = 0; refIndex = 0; effectIndex = 0;
+		states[0] = collapsed; states[1] = !collapsed;
+		const tree = turn({agentActivityProps:{},persistedCollapsed:collapsed,hovered});
+		const body = tree.props.children.at(-1);
+		assert.equal(body.type, 'motion-div');
+		assert.equal(body.props.className, '-ms-2 ps-2');
+		assert.equal(body.props.inert, false);
+		assert.equal(body.props.initial, false);
+		assert.equal(body.props.exit, undefined);
+		assert.equal(body.props.style.overflow, 'visible');
+		assert.equal(body.props.animate, 'expanded');
+		const entries = body.props.children[0].props.children[0];
+		assert.deepEqual([...tree.props.children[0].props.units,...entries.props.units], [leading,hidden,persistent]);
+		assert.deepEqual(tree.props.children[2], [], 'persistent items are already in the expanded body');
+		assert.equal(entries.props.wrapSearchableContent({item:hidden.item.item,content:'tool'}).props.style.opacity, collapsed ? .9 : 1);
+		assert.equal(entries.props.wrapSearchableContent({item:persistent.item.item,content:'message'}).props.style.opacity, 1);
+		for (const effect of effects.splice(0)) effect();
+		assert.equal(states[collapsed ? 0 : 1], false, 'the original completion contract settles the active animation flag');
+		// Commit the settled state before toggling again with the same persisted
+		// collapse value; the animation target itself never changes in all mode.
+		stateIndex = 0; refIndex = 0; effectIndex = 0;
+		turn({agentActivityProps:{},persistedCollapsed:collapsed,hovered});
+		for (const effect of effects.splice(0)) effect();
+	}
+	withArchive(archiveFixture(source), archive =>
+	{
+		const original = fs.readFileSync(archive);
+		operate('--apply', archive, 'preload-build', 'all');
+		const first = fs.readFileSync(archive);
+		operate('--apply', archive, 'preload-build', 'all');
+		assert.deepEqual(fs.readFileSync(archive), first);
+		operate('--apply', archive, 'preload-build', 'messages');
+		operate('--apply', archive, 'preload-build', 'all');
+		assert.deepEqual(fs.readFileSync(archive), first);
+		operate('--restore', archive);
+		assert.deepEqual(fs.readFileSync(archive), original);
+	});
+});
+
+test('unreviewed hover preload shapes and hiding modifications are refused', () =>
+{
+	const source = preloadModeRenderer().toString();
+	for (const [from,to] of [
+		['hovered || !collapsed', 'hovered && !collapsed'],
+		['collapsed&&!closing&&"invisible"', 'collapsed&&closing&&"invisible"'],
+		['inert:collapsed', 'inert:other'],
+		['overflow:collapsed||animating?', 'overflow:collapsed&&animating?'],
+		['animate:collapsed?"preloaded":"expanded"', 'animate:other?"preloaded":"expanded"'],
+		['height:reduced&&closing?"auto":0', 'height:reduced&&animating?"auto":0'],
+		['if(event==="preloaded"&&collapsed)', 'if(event==="other"&&collapsed)'],
+		['setClosing(!1);return', 'setClosing(!0);return'],
+	])
+	{
+		const changed = Buffer.from(source.replace(from,to));
+		assert.notEqual(changed.toString(), source);
+		assert.equal(inspectExpandedRenderer(changed).status, 'unsupported');
+		assert.throws(() => patchBundle(changed, 'all'), /original|unsupported/i);
+	}
+	const patched = patchBundle(Buffer.from(source), 'all').toString();
+	for (const [from,to] of [
+		['inert:false', 'inert:true'],
+		['className:"-ms-2 ps-2",inert:false', 'className:"-ms-2 ps-2 invisible",inert:false'],
+		['overflow:"visible"', 'overflow:"hidden"'],
+		[')(collapsed?"preloaded":"expanded")', ')(collapsed?"expanded":"preloaded")'],
+		['[collapsed,animating,closing]', '[collapsed]'],
+	])
+	{
+		const changed = patched.replace(from,to);
+		assert.notEqual(changed, patched);
+		assert.throws(() => inspectExpandedRenderer(Buffer.from(changed)), /modified|incomplete/i);
+	}
+});
+
 test('unresolved or hiding animation variants fail without changing the archive', () =>
 {
 	let source = variantModeRenderer().toString();
@@ -524,9 +681,10 @@ test('unknown completion callbacks, late captures and inconsistent hooks are ref
 	}
 });
 
-test('completion effect preserves review jumps, cancellation and duplicate guards', async () =>
+for (const [name,renderer] of [['named',variantModeRenderer],['preload',preloadModeRenderer]])
+test(`${name} completion effect preserves review jumps, cancellation and duplicate guards`, async () =>
 {
-	const patched = patchBundle(variantModeRenderer(),'all');
+	const patched = patchBundle(renderer(),'all');
 	const refs = [], previous = [], effects = [], jumps = [];
 	let refIndex = 0, effectIndex = 0, settle;
 	const runtime = {

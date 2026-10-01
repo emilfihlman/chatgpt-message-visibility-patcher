@@ -48,6 +48,14 @@ hooks, review controls, and animation callbacks remain in place. A verified
 completion callback also runs after collapse state changes so review-denial
 navigation still works when no new animation completes.
 
+Build **26.928.31416** adds a guarded final-assistant classifier branch and hover
+preloading for collapsed turn content. The patcher preserves the new classifier
+exception and recognizes the reviewed preload animation. Expanded mode removes
+its invisible class, inert state, and clipping while keeping the existing
+controls and review callback. Opening and closing flags settle even when a
+controlled collapse value stays unchanged. Leading transcript content remains
+in its original position and is rendered once.
+
 If automatic reapplication fails, the helper saves a bounded diagnostic locally.
 `--check` displays that warning on stderr alongside its normal JSON stdout,
 including the package version and selected mode. Updating the patcher and
@@ -93,13 +101,14 @@ automatic-hook failure reporting. Named animation variants also cover repeated
 collapse changes, unresolved or hiding targets, completion-callback matching, and
 modified patches. Test fixtures contain no app bundles or conversation data.
 
-Validated offline against the **26.924.20706** and **26.924.22138** package archives
-in both modes: patched JavaScript parses, ASAR integrity checks pass, and all
+Validated offline against the **26.928.31416**, **26.924.20706**, and
+**26.924.22138** package archives in both modes: patched JavaScript parses,
+ASAR integrity checks pass, and all
 unrelated packed files remain byte-for-byte identical. The updated patcher also
 reproduces the existing **26.917.71314** all-mode archive exactly, preserving
 matching-backup compatibility. Earlier validation covered **26.915.31945** and
 **26.901.51231**, including restoration of previously published patches.
-Headless browser checks of the extracted **26.924.22138** turn and group functions
+Headless browser checks of the extracted **26.928.31416** and **26.924.22138** turn and group functions
 with React **19.3.0** and Motion **12.43.0** reproduce the original hiding and verify
 patched visibility, ordering, dimming, and DOM/input/focus/selection/scroll
 preservation across repeated updates and toggles. Review-navigation checks cover
@@ -107,11 +116,9 @@ the preserved completion callback and cancellation guards. These component check
 use synthetic leaf renderers and providers and separately installed browser-test
 dependencies; they do not constitute a complete desktop end-to-end test.
 
-As of **2026-09-27**, the official Linux stable feed offers **26.924.22138**, but
-the separate [task-startup regression](https://github.com/openai/codex/issues/48189)
-still has reports affecting that build and no confirmed fixed release. Patcher
-compatibility does not establish that task startup works. Offline archive and
-component testing does not require upgrading or restarting the desktop app.
+The official Linux stable feed was refreshed and checked on **2026-10-01**;
+its latest available package was **26.928.31416**. Offline archive and component
+testing does not require upgrading or restarting the desktop app.
 
 ## Why the September update broke the old patch
 

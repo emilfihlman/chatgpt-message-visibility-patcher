@@ -24,7 +24,9 @@ function shape(specification) {
     return escape(token);
   }).join('\\s*');
 }
-const prefix = shape('function $fn ( { unit : $unit , keepMcpAppEntriesPersistent : $keep , mcpServerStatuses : $statuses , renderMcpApps : $render } ) { if ( $unit . kind !== "standalone" ) return ! 1 ; let $item = $unit . item . item ; return $item . type === "dynamic-tool-call" && $dynamic ( $item ) || $keep && $render && $item . type === "mcp-tool-call" && $mcp ( { item : $item , mcpServerStatuses : $statuses } ) ? ! 0 :');
+const prefix = shape('function $fn ( { unit : $unit , keepMcpAppEntriesPersistent : $keep , mcpServerStatuses : $statuses , renderMcpApps : $render } ) { if ( $unit . kind !== "standalone" ) return ! 1 ; let $item = $unit . item . item ; return') + '\\s*' +
+	`(?:${shape('$item . type === "assistant-message" && $assistant ( $item ) ||')}\\s*)?` +
+	shape('$item . type === "dynamic-tool-call" && $dynamic ( $item ) || $keep && $render && $item . type === "mcp-tool-call" && $mcp ( { item : $item , mcpServerStatuses : $statuses } ) ? ! 0 :');
 const originalPredicate = shape('$item . type === "user-message" && ( $item . steeringStatus != null || $item . hookFeedback === ! 0 )');
 const persistentPredicate = shape('$item . type === "assistant-message" || $item . type === "user-message"');
 const classifierPattern = new RegExp(`\\b${prefix}\\s*(?<predicate>${originalPredicate}|${persistentPredicate})\\s*;?\\s*}`, 'g');
@@ -154,9 +156,15 @@ function markerStatement(node, marker) {
 }
 function editNode(node, replacement) { return {start:node.start, end:node.end, text:replacement}; }
 
-function expandedTurnAnimation(props)
+function expandedTurnAnimation(props, collapseName)
 {
-	const animate = props.get('animate');
+	let animate = props.get('animate');
+	if (animate?.type === 'ConditionalExpression')
+	{
+		if (!collapseName || animate.test.type !== 'Identifier' || animate.test.name !== collapseName ||
+			literal(animate.consequent) !== 'preloaded' || literal(animate.alternate) !== 'expanded') return false;
+		animate = animate.alternate;
+	}
 	// Newer builds name an inline variant instead of passing its target directly.
 	// Resolve only a literal name in this element's own variants object.
 	const target = animate?.type === 'ObjectExpression' ? animate :
@@ -188,6 +196,13 @@ const TURN_COMPLETION = normalizedFunction(parse(`event=>{
 	let token=revision.current;
 	settled().then(()=>{revision.current===token&&body.current?.querySelector("[data-auto-review-denied]")?.scrollIntoView({block:"center",behavior:reduced?"instant":"smooth"})})
 }`, {ecmaVersion:'latest'}).body[0].expression);
+const PRELOAD_COMPLETION = normalizedFunction(parse(`event=>{
+	if(event==="preloaded"&&collapsed){setClosing(!1);return}
+	if(event!=="expanded"||collapsed||(setAnimating(!1),!pending.current))return;
+	pending.current=!1;
+	let token=revision.current;
+	settled().then(()=>{revision.current===token&&body.current?.querySelector("[data-auto-review-denied]")?.scrollIntoView({block:"center",behavior:reduced?"instant":"smooth"})})
+}`, {ecmaVersion:'latest'}).body[0].expression);
 const COMPLETION_MARKER = 'message-visibility:review-complete';
 
 function bindingNames(pattern)
@@ -211,17 +226,20 @@ function hookMember(call)
 function turnCompletion(node, props, collapseName, before)
 {
 	const callback = props.get('onAnimationComplete');
-	if (literal(props.get('animate')) !== 'expanded' || callback?.type !== 'ArrowFunctionExpression') return null;
+	if (!expandedTurnAnimation(props, collapseName) || callback?.type !== 'ArrowFunctionExpression') return null;
 	const normalized = normalizedFunction(callback);
-	if (normalized.fingerprint !== TURN_COMPLETION.fingerprint) return null;
-	const names = Object.fromEntries(TURN_COMPLETION.names.map((name,index) => [name,normalized.names[index]]));
+	const contract = normalized.fingerprint === TURN_COMPLETION.fingerprint ? TURN_COMPLETION :
+		normalized.fingerprint === PRELOAD_COMPLETION.fingerprint ? PRELOAD_COMPLETION : null;
+	if (!contract) return null;
+	const preloaded = contract === PRELOAD_COMPLETION;
+	const names = Object.fromEntries(contract.names.map((name,index) => [name,normalized.names[index]]));
 	if (names.collapsed !== collapseName || props.get('ref')?.name !== names.body) return null;
 	const nodes = syntaxNodes(node);
 	const hooks = nodes.map(hookMember).filter(callee => callee && ['useState','useRef','useLayoutEffect'].includes(propertyName(callee)));
 	if (!hooks.some(callee => propertyName(callee) === 'useLayoutEffect') || new Set(hooks.map(callee => callee.object.name)).size !== 1) return null;
 	const runtime = hooks[0].object.name;
 	const declarations = node.body.body.filter(statement => statement.type === 'VariableDeclaration').flatMap(statement => statement.declarations);
-	for (const name of ['collapsed','setAnimating','pending','revision','body','reduced'])
+	for (const name of ['collapsed','setAnimating','pending','revision','body','reduced', ...(preloaded ? ['setClosing'] : [])])
 	{
 		const declaration = one(declarations, entry => bindingNames(entry.id).includes(names[name]));
 		if (!declaration || declaration.end > before) return null;
@@ -233,7 +251,15 @@ function turnCompletion(node, props, collapseName, before)
 	const setter = one(declarations, entry => entry.id.type === 'ArrayPattern' && entry.id.elements[1]?.name === names.setAnimating);
 	const stateHook = hookMember(setter?.init);
 	if (setter?.id.elements[0]?.type !== 'Identifier' || !stateHook || propertyName(stateHook) !== 'useState' || stateHook.object.name !== runtime) return null;
-	return {callback,names,runtime,animationState:setter.id.elements[0].name};
+	let closingState;
+	if (preloaded)
+	{
+		const closing = one(declarations, entry => entry.id.type === 'ArrayPattern' && entry.id.elements[1]?.name === names.setClosing);
+		const closingHook = hookMember(closing?.init);
+		if (closing?.id.elements[0]?.type !== 'Identifier' || !closingHook || propertyName(closingHook) !== 'useState' || closingHook.object.name !== runtime) return null;
+		closingState = closing.id.elements[0].name;
+	}
+	return {callback,names,runtime,animationState:setter.id.elements[0].name,preloaded,closingState};
 }
 
 function completionEffect(node, props, collapseName)
@@ -251,11 +277,45 @@ function completionEffect(node, props, collapseName)
 	const completion = turnCompletion(node, props, collapseName, call.start), callee = hookMember(call);
 	const invoke = effect.body.body[1]?.expression, dependencies = call.arguments[1];
 	if (!completion || callee?.object.name !== completion.runtime || propertyName(callee) !== 'useLayoutEffect' ||
-		dependencies.type !== 'ArrayExpression' || dependencies.elements.length !== 1 || dependencies.elements[0]?.name !== collapseName ||
-		invoke?.type !== 'CallExpression' || invoke.arguments.length !== 1 || literal(invoke.arguments[0]) !== 'expanded' ||
+		dependencies.type !== 'ArrayExpression' ||
+		invoke?.type !== 'CallExpression' || invoke.arguments.length !== 1 ||
 		invoke.callee.type !== 'ArrowFunctionExpression') return false;
+	const expectedDependencies = [collapseName, ...(completion.preloaded ? [completion.animationState,completion.closingState] : [])];
+	if (dependencies.elements.length !== expectedDependencies.length || dependencies.elements.some((value,index) =>
+		value?.type !== 'Identifier' || value.name !== expectedDependencies[index])) return false;
+	const event = invoke.arguments[0];
+	if (completion.preloaded ? event?.type !== 'ConditionalExpression' || event.test.type !== 'Identifier' || event.test.name !== collapseName ||
+		literal(event.consequent) !== 'preloaded' || literal(event.alternate) !== 'expanded' : literal(event) !== 'expanded') return false;
+	if (completion.preloaded && literal(props.get('inert')) !== false) return false;
 	const copied = normalizedFunction(invoke.callee), original = normalizedFunction(completion.callback);
 	return copied.fingerprint === original.fingerprint && JSON.stringify(copied.names) === JSON.stringify(original.names);
+}
+
+function preloadTurnProps(props, collapseName, completion)
+{
+	const className = props.get('className'), inert = props.get('inert'), animate = props.get('animate');
+	const invisible = className?.arguments?.[1], decision = invisible?.left;
+	if (className?.type !== 'CallExpression' || className.callee.type !== 'Identifier' || className.arguments.length !== 2 ||
+		literal(className.arguments[0]) !== '-ms-2 ps-2' || invisible?.type !== 'LogicalExpression' || invisible.operator !== '&&' ||
+		literal(invisible.right) !== 'invisible' || decision?.type !== 'LogicalExpression' || decision.operator !== '&&' ||
+		decision.left.type !== 'Identifier' || decision.left.name !== collapseName || decision.right.type !== 'UnaryExpression' ||
+		decision.right.operator !== '!' || decision.right.argument.name !== completion.closingState ||
+		inert?.type !== 'Identifier' || inert.name !== collapseName || animate?.type !== 'ConditionalExpression') return false;
+	const initial = props.get('initial'), preload = fields(props.get('variants')).get('preloaded'), values = fields(preload);
+	const height = values.get('height'), reduced = completion.names.reduced;
+	function reducedVariant(value, expanded, collapsed)
+	{
+		return value?.type === 'ConditionalExpression' && value.test.type === 'Identifier' && value.test.name === reduced &&
+			literal(value.consequent) === expanded && literal(value.alternate) === collapsed;
+	}
+	if (preload?.type !== 'ObjectExpression' || preload.properties.some(property => property.type !== 'Property' || property.computed) ||
+		literal(values.get('opacity')) !== 0 || height?.type !== 'ConditionalExpression' ||
+		height.test.type !== 'LogicalExpression' || height.test.operator !== '&&' || height.test.left.name !== reduced ||
+		height.test.right.name !== completion.closingState || literal(height.consequent) !== 'auto' || literal(height.alternate) !== 0 ||
+		!reducedVariant(values.get('transform'), 'translateY(0)', 'translateY(-8px)') ||
+		!reducedVariant(fields(initial.consequent).get('height'), 'auto', 0) ||
+		!reducedVariant(fields(initial.consequent).get('transform'), 'translateY(0)', 'translateY(-8px)')) return false;
+	return true;
 }
 
 function structuralTurn(node, text) {
@@ -282,25 +342,34 @@ function structuralTurn(node, text) {
   const summary = one(nodes, child => jsxCall(child) && fields(child.arguments[1]).has('collapsedMessageCount') &&
     fields(child.arguments[1]).get('isCollapsed')?.name === collapseName);
   const body = one(nodes, child => child.type === 'ConditionalExpression' && child.test.type === 'LogicalExpression' && child.test.operator === '&&' &&
-    child.test.left.type === 'UnaryExpression' && child.test.left.operator === '!' && child.test.left.argument.name === collapseName &&
+    ((child.test.left.type === 'UnaryExpression' && child.test.left.operator === '!' && child.test.left.argument.name === collapseName) ||
+      (child.test.left.type === 'LogicalExpression' && child.test.left.operator === '||' && child.test.left.left.type === 'Identifier' &&
+        child.test.left.right.type === 'UnaryExpression' && child.test.left.right.operator === '!' && child.test.left.right.argument.name === collapseName)) &&
     nonNull(child.test.right) && jsxCall(child.consequent) && literal(child.alternate) === null);
   if (!declaration || !summary || !body) return null;
   const bodyFields = fields(body.consequent.arguments[1]);
-  if (literal(bodyFields.get('className')) !== '-ms-2 ps-2' || !expandedTurnAnimation(bodyFields) ||
+  const preloaded = body.test.left.type === 'LogicalExpression';
+  if ((!preloaded && literal(bodyFields.get('className')) !== '-ms-2 ps-2') || !expandedTurnAnimation(bodyFields, collapseName) ||
       !originalTurnInitial(bodyFields.get('initial')) || bodyFields.get('exit')?.type !== 'ObjectExpression') return null;
   const animationEdits = [];
   let completionHook = '';
-  if (typeof literal(bodyFields.get('animate')) === 'string') {
+  if (typeof literal(bodyFields.get('animate')) === 'string' || preloaded) {
     const initial = bodyFields.get('initial'), overflow = fields(bodyFields.get('style')).get('overflow');
     const completion = turnCompletion(node, bodyFields, collapseName, declaration.end);
     if (initial.type !== 'ConditionalExpression' || overflow?.type !== 'ConditionalExpression' ||
-        overflow.test.type !== 'Identifier' || overflow.test.name !== initial.test.name ||
         literal(overflow.consequent) !== 'hidden' || literal(overflow.alternate) !== 'visible' ||
-        !completion || initial.test.name !== completion.animationState) return null;
+        !completion || completion.preloaded !== preloaded || initial.test.name !== completion.animationState) return null;
+    if (preloaded) {
+      if (!preloadTurnProps(bodyFields, collapseName, completion) || overflow.test.type !== 'LogicalExpression' || overflow.test.operator !== '||' ||
+          overflow.test.left.name !== collapseName || overflow.test.right.name !== completion.animationState) return null;
+      animationEdits.push(editNode(bodyFields.get('className'), '"-ms-2 ps-2"'), editNode(bodyFields.get('inert'), 'false'), editNode(bodyFields.get('animate'), '"expanded"'));
+    } else if (overflow.test.type !== 'Identifier' || overflow.test.name !== initial.test.name) return null;
     // The body now stays mounted. A repeated expand can set the upstream animation
     // flag without changing its target, so no completion callback may clear it.
     animationEdits.push(editNode(overflow, '"visible"'));
-    completionHook = `${completion.runtime}.useLayoutEffect(()=>{"${COMPLETION_MARKER}";(${text.slice(completion.callback.start,completion.callback.end)})("expanded")},[${collapseName}]);`;
+    const event = preloaded ? `${collapseName}?"preloaded":"expanded"` : '"expanded"';
+    const dependencies = [collapseName, ...(preloaded ? [completion.animationState,completion.closingState] : [])].join(',');
+    completionHook = `${completion.runtime}.useLayoutEffect(()=>{"${COMPLETION_MARKER}";(${text.slice(completion.callback.start,completion.callback.end)})(${event})},[${dependencies}]);`;
   }
   const entries = one(nodes, child => jsxCall(child) && child.arguments[1].properties.some(prop => prop.type === 'SpreadElement' && prop.argument.name === base.name) &&
     child.arguments[1].properties.some(prop => prop.type === 'SpreadElement' && prop.argument.name === visible.name) && fields(child.arguments[1]).get('units')?.type === 'Identifier');
@@ -373,7 +442,9 @@ function inspectPatchedStructure(node, role) {
     const body = one(nodes, child => child.type === 'ConditionalExpression' && child.test === content && jsxCall(child.consequent) && literal(child.alternate) === null);
     if (!body) return false;
     const props = fields(body.consequent.arguments[1]), initial = props.get('initial');
-    if (initial?.type !== 'UnaryExpression' || initial.operator !== '!' || literal(initial.argument) !== 1 || !isVoid(props.get('exit')) ||
+    if (literal(props.get('className')) !== '-ms-2 ps-2' ||
+      (props.has('inert') && literal(props.get('inert')) !== false) ||
+      initial?.type !== 'UnaryExpression' || initial.operator !== '!' || literal(initial.argument) !== 1 || !isVoid(props.get('exit')) ||
       !expandedTurnAnimation(props)) return false;
     if (typeof literal(props.get('animate')) === 'string' && literal(fields(props.get('style')).get('overflow')) !== 'visible') return false;
     const helper = one(nodes, child => child.type === 'FunctionDeclaration' && child.id.name === 'mvVisibility');
